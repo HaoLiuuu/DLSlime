@@ -1,17 +1,4 @@
-# asio is header-only.  Try find_package, fall back to manual detection.
-find_package(asio QUIET)
-if(NOT asio_FOUND)
-    if(EXISTS /usr/include/asio.hpp)
-        add_library(asio::asio INTERFACE IMPORTED)
-        target_include_directories(asio::asio INTERFACE /usr/include)
-    elseif(EXISTS /usr/include/boost/asio.hpp)
-        add_library(asio::asio INTERFACE IMPORTED)
-        target_include_directories(asio::asio INTERFACE /usr/include/boost)
-        target_compile_definitions(asio::asio INTERFACE ASIO_STANDALONE)
-    else()
-        message(FATAL_ERROR "asio not found. Install libasio-dev or boost.")
-    endif()
-endif()
+include(${CMAKE_CURRENT_LIST_DIR}/../../../../cmake/StandaloneAsio.cmake)
 
 add_library(_slime_tcp SHARED
     tcp_memory_pool.cpp
@@ -22,9 +9,6 @@ add_library(_slime_tcp SHARED
 )
 
 target_compile_definitions(_slime_tcp PRIVATE ASIO_STANDALONE)
-
-# Workaround: asio awaitable.hpp uses std::exchange without including <utility>
-target_compile_options(_slime_tcp PRIVATE -include utility)
 
 if (USE_CUDA)
     find_package(CUDAToolkit REQUIRED)

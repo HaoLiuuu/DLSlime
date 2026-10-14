@@ -2,270 +2,339 @@
 
 #include <endian.h>
 
-#include <asio/error.hpp>
-#include <asio/read.hpp>
-#include <asio/write.hpp>
-#include <cstring>
-
-#include "dlslime/csrc/logging.h"
-
+#include <algorithm>
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
 #endif
 
-namespace dlslime {
-namespace tcp {
-
-// ── helpers ─────────────────────────────────────────────
-
-static void hdr_to_net(SessionHeader& hdr)
+namespace dlslime::tcp {
+namespace {
+bool is_device(const void* ptr)
 {
-    hdr.size = htole64(hdr.size);
-    hdr.addr = htole64(hdr.addr);
-}
-
-static void hdr_to_host(SessionHeader& hdr)
-{
-    hdr.size = le64toh(hdr.size);
-    hdr.addr = le64toh(hdr.addr);
-}
-
-static bool is_fatal(asio::error_code ec)
-{
-    return ec && ec != asio::error::eof;
-}
-
 #ifdef USE_CUDA
-static bool is_cuda_memory(const void* addr)
-{
-    cudaPointerAttributes attr;
-    auto                  st = cudaPointerGetAttributes(&attr, addr);
-    return (st == cudaSuccess && attr.type == cudaMemoryTypeDevice);
-}
+    cudaPointerAttributes attr{};
+    return cudaPointerGetAttributes(&attr, ptr) == cudaSuccess && attr.type == cudaMemoryTypeDevice;
+#else
+    (void)ptr;
+    return false;
 #endif
+}
+bool copy_to_host(void* dst, const void* src, size_t size)
+{
+#ifdef USE_CUDA
+    return cudaMemcpy(dst, src, size, cudaMemcpyDeviceToHost) == cudaSuccess;
+#else
+    (void)dst;
+    (void)src;
+    (void)size;
+    return false;
+#endif
+}
+bool copy_to_device(void* dst, const void* src, size_t size)
+{
+#ifdef USE_CUDA
+    return cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice) == cudaSuccess;
+#else
+    (void)dst;
+    (void)src;
+    (void)size;
+    return false;
+#endif
+}
+}  // namespace
 
-// ── ServerSession ───────────────────────────────────────
-
-ServerSession::ServerSession(asio::ip::tcp::socket socket, TcpMemoryPool* local_pool, RecvMatcher recv_matcher):
-    socket_(std::move(socket)), local_pool_(local_pool), recv_matcher_(std::move(recv_matcher))
+ServerSession::ServerSession(asio::ip::tcp::socket          socket,
+                             std::shared_ptr<TcpMemoryPool> pool,
+                             RecvMatcher                    matcher,
+                             DoneCallback                   done):
+    socket_(std::move(socket)),
+    local_pool_(std::move(pool)),
+    recv_matcher_(std::move(matcher)),
+    on_done_(std::move(done))
 {
 }
-
 void ServerSession::start()
 {
     readHeader();
 }
-
+void ServerSession::cancel()
+{
+    asio::error_code ignored;
+    socket_.close(ignored);
+    // The outstanding callback retires any active receive buffer before completion.
+}
+void ServerSession::finish()
+{
+    if (finished_)
+        return;
+    finished_ = true;
+    cancel();
+    if (recv_.op_state)
+        recv_.op_state->complete(TCP_FAILED);
+    recv_ = {};
+    if (on_done_)
+        on_done_(this);
+}
 void ServerSession::readHeader()
 {
     auto self = shared_from_this();
-    header_   = {};
-    asio::async_read(socket_, asio::buffer(&header_, sizeof(header_)), [this, self](asio::error_code ec, size_t /*n*/) {
+    asio::async_read(socket_, asio::buffer(&header_, sizeof(header_)), [self](asio::error_code ec, size_t) {
         if (ec) {
-            if (is_fatal(ec))
-                SLIME_LOG_WARN("ServerSession::readHeader ", ec.message());
+            self->finish();
             return;
         }
-        hdr_to_host(header_);
-        dispatch();
+        self->header_.size = le64toh(self->header_.size);
+        self->header_.addr = le64toh(self->header_.addr);
+        try {
+            self->dispatch();
+        }
+        catch (...) {
+            self->finish();
+        }
     });
 }
-
 void ServerSession::dispatch()
 {
-    switch (header_.opcode) {
-
-        case OP_SEND: {
-            if (header_.size == 0) {
-                readHeader();
-                return;
-            }
-            auto slot = recv_matcher_();
-            if (!slot.buffer || slot.length == 0) {
-                SLIME_LOG_WARN("ServerSession: OP_SEND with no pending recv");
-                readHeader();
-                return;
-            }
-            if (slot.exact_size && header_.size != slot.length) {
-                SLIME_LOG_WARN("ServerSession: size mismatch, send ", header_.size, " != recv ", slot.length);
-                if (slot.op_state) {
-                    slot.op_state->completion_status.store(TCP_FAILED, std::memory_order_release);
-                    if (slot.op_state->signal)
-                        slot.op_state->signal->set_comm_done(0);
-                }
-                readHeader();
-                return;
-            }
-
-            // Always drain the full send payload from the wire.  If recv buffer
-            // is smaller, read into a temp buffer then copy what fits.
-            size_t n_read   = static_cast<size_t>(header_.size);
-            size_t n_copy   = std::min(n_read, slot.length);
-            auto*  dst      = reinterpret_cast<char*>(slot.buffer);
-            bool   overflow = false;
-
-            if (header_.size > slot.length) {
-                dst      = new char[n_read];
-                overflow = true;
-            }
-
-            auto self = shared_from_this();
-            asio::async_read(socket_,
-                             asio::buffer(dst, n_read),
-                             [this, self, slot, n_copy, dst, overflow](asio::error_code ec, size_t /*rn*/) {
-                                 if (ec) {
-                                     if (is_fatal(ec))
-                                         SLIME_LOG_WARN("ServerSession SEND read: ", ec.message());
-                                     if (overflow)
-                                         delete[] dst;
-                                     return;
-                                 }
-                                 if (overflow) {
-                                     std::memcpy(reinterpret_cast<void*>(slot.buffer), dst, n_copy);
-                                     delete[] dst;
-                                 }
-                                 if (slot.post_read)
-                                     slot.post_read();
-                                 if (slot.op_state) {
-                                     slot.op_state->bytes_copied = n_copy;
-                                     slot.op_state->completion_status.store(TCP_SUCCESS, std::memory_order_release);
-                                     if (slot.op_state->signal)
-                                         slot.op_state->signal->set_comm_done(0);
-                                 }
-                                 readHeader();
-                             });
-            break;
-        }
-
-        case OP_WRITE:
-            if (header_.size == 0) {
-                readHeader();
-                return;
-            }
-            readBody(reinterpret_cast<void*>(header_.addr), header_.size);
-            break;
-
-        case OP_READ: {
-            uintptr_t addr = static_cast<uintptr_t>(header_.addr);
-            size_t    sz   = static_cast<size_t>(header_.size);
-            if (sz == 0) {
-                readHeader();
-                return;
-            }
-            writeBody(reinterpret_cast<const void*>(addr), sz);
-            break;
-        }
-
-        default:
-            SLIME_LOG_WARN("ServerSession: unknown opcode ", static_cast<int>(header_.opcode));
-            readHeader();
-            break;
+    if (header_.opcode == OP_SEND) {
+        receiveSend();
+        return;
     }
+    if ((header_.opcode != OP_READ && header_.opcode != OP_WRITE)
+        || !local_pool_->contains(header_.addr, header_.size)) {
+        finish();  // Unknown framing or invalid range must never become another header.
+        return;
+    }
+    if (header_.opcode == OP_READ)
+        writeBody(reinterpret_cast<const void*>(header_.addr), header_.size);
+    else
+        readBody(reinterpret_cast<void*>(header_.addr), header_.size);
 }
-
-void ServerSession::readBody(void* dst, size_t len)
+void ServerSession::receiveSend()
 {
-    auto* ptr     = static_cast<char*>(dst);
-    bool  is_cuda = false;
-#ifdef USE_CUDA
-    if (is_cuda_memory(dst)) {
-        ptr     = new char[len];
-        is_cuda = true;
+    recv_      = recv_matcher_();
+    rejected_  = !recv_.op_state || (recv_.exact_size && header_.size != recv_.length);
+    copied_    = rejected_ ? 0 : std::min<uint64_t>(header_.size, recv_.length);
+    remaining_ = header_.size - copied_;
+    if (!copied_) {
+        drainSend();
+        return;
     }
-#endif
-
     auto self = shared_from_this();
-    asio::async_read(socket_,
-                     asio::buffer(ptr, len),
-                     [this, self, real_addr = reinterpret_cast<uintptr_t>(dst), len, is_cuda, ptr](asio::error_code ec,
-                                                                                                   size_t /*n*/) {
-                         if (ec) {
-                             if (is_fatal(ec))
-                                 SLIME_LOG_WARN("ServerSession::readBody ", ec.message());
-                             if (is_cuda)
-                                 delete[] ptr;
-                             return;
-                         }
-#ifdef USE_CUDA
-                         if (is_cuda) {
-                             auto cu_err =
-                                 cudaMemcpy(reinterpret_cast<void*>(real_addr), ptr, len, cudaMemcpyHostToDevice);
-                             if (cu_err != cudaSuccess)
-                                 SLIME_LOG_ERROR("readBody cudaMemcpy H2D: ", cudaGetErrorString(cu_err));
-                             delete[] ptr;
-                         }
-#endif
-                         readHeader();
-                     });
+    asio::async_read(
+        socket_, asio::buffer(reinterpret_cast<void*>(recv_.buffer), copied_), [self](asio::error_code ec, size_t) {
+            if (ec)
+                self->finishSend(ec);
+            else
+                self->drainSend();
+        });
 }
-
-void ServerSession::writeBody(const void* src, size_t len)
+void ServerSession::drainSend()
 {
-    auto* ptr     = static_cast<const char*>(src);
-    bool  is_cuda = false;
-#ifdef USE_CUDA
-    if (is_cuda_memory(src)) {
-        auto* buf    = new char[len];
-        auto  cu_err = cudaMemcpy(buf, src, len, cudaMemcpyDeviceToHost);
-        if (cu_err != cudaSuccess) {
-            SLIME_LOG_ERROR("writeBody cudaMemcpy D2H: ", cudaGetErrorString(cu_err));
-            delete[] buf;
-            ptr = static_cast<const char*>(src);
-        }
-        else {
-            ptr     = buf;
-            is_cuda = true;
-        }
+    if (!remaining_) {
+        finishSend({});
+        return;
     }
-#endif
-
-    auto self = shared_from_this();
-    asio::async_write(socket_, asio::buffer(ptr, len), [this, self, is_cuda, ptr](asio::error_code ec, size_t /*n*/) {
-        if (is_cuda)
-            delete[] ptr;
-        if (ec && is_fatal(ec))
-            SLIME_LOG_WARN("ServerSession::writeBody ", ec.message());
-        readHeader();
-    });
-}
-
-// ── ClientSession ───────────────────────────────────────
-
-ClientSession::ClientSession(asio::ip::tcp::socket sock, DoneCallback on_done):
-    socket_(std::move(sock)), on_done_(std::move(on_done))
-{
-}
-
-void ClientSession::start_write(const SessionHeader& hdr, const void* payload)
-{
-    auto          self = shared_from_this();
-    SessionHeader net  = hdr;
-    hdr_to_net(net);
-    std::array<asio::const_buffer, 2> bufs = {asio::buffer(&net, sizeof(net)), asio::buffer(payload, hdr.size)};
-    asio::async_write(socket_, bufs, [this, self](asio::error_code ec, size_t) {
-        if (on_done_)
-            on_done_(ec);
-    });
-}
-
-void ClientSession::start_read(const SessionHeader& hdr, void* dst)
-{
-    auto self         = shared_from_this();
-    hdr_              = hdr;
-    SessionHeader net = hdr;
-    hdr_to_net(net);
-    asio::async_write(socket_, asio::buffer(&net, sizeof(net)), [this, self, dst](asio::error_code ec, size_t) {
+    auto       self  = shared_from_this();
+    const auto count = std::min<uint64_t>(remaining_, discard_.size());
+    asio::async_read(socket_, asio::buffer(discard_.data(), count), [self](asio::error_code ec, size_t n) {
         if (ec) {
-            if (on_done_)
-                on_done_(ec);
+            self->finishSend(ec);
             return;
         }
-        asio::async_read(socket_, asio::buffer(dst, hdr_.size), [this, self](asio::error_code ec, size_t) {
-            if (on_done_)
-                on_done_(ec);
-        });
+        self->remaining_ -= n;
+        self->drainSend();
+    });
+}
+void ServerSession::finishSend(asio::error_code ec)
+{
+    if (!ec && !rejected_ && recv_.post_read)
+        ec = recv_.post_read(copied_);
+    if (recv_.op_state) {
+        recv_.op_state->bytes_copied = ec || rejected_ ? 0 : copied_;
+        recv_.op_state->complete(ec || rejected_ ? TCP_FAILED : TCP_SUCCESS);
+    }
+    recv_ = {};
+    if (ec)
+        finish();
+    else
+        readHeader();
+}
+void ServerSession::readBody(void* dst, size_t len)
+{
+    const bool device = is_device(dst);
+    void*      target = dst;
+    if (device) {
+        staging_.resize(len);
+        target = staging_.data();
+    }
+    auto self = shared_from_this();
+    asio::async_read(socket_, asio::buffer(target, len), [self, dst, len, device](asio::error_code ec, size_t) {
+        if (!ec && device && !copy_to_device(dst, self->staging_.data(), len))
+            ec = asio::error::fault;
+        if (ec)
+            self->finish();
+        else
+            self->readHeader();
+    });
+}
+void ServerSession::writeBody(const void* src, size_t len)
+{
+    const void* source = src;
+    if (is_device(src)) {
+        staging_.resize(len);
+        if (!copy_to_host(staging_.data(), src, len)) {
+            finish();
+            return;
+        }
+        source = staging_.data();
+    }
+    auto self = shared_from_this();
+    asio::async_write(socket_, asio::buffer(source, len), [self](asio::error_code ec, size_t) {
+        if (ec)
+            self->finish();
+        else
+            self->readHeader();
     });
 }
 
-}  // namespace tcp
-}  // namespace dlslime
+ClientSession::ClientSession(asio::io_context& io, std::shared_ptr<PooledConnection> conn, DoneCallback done):
+    conn_(std::move(conn)), resolver_(io), timer_(io), on_done_(std::move(done))
+{
+}
+void ClientSession::start(std::vector<TcpTransfer> transfers, Deadline deadline)
+{
+    transfers_ = std::move(transfers);
+    if (deadline <= std::chrono::steady_clock::now()) {
+        finish(asio::error::timed_out);
+        return;
+    }
+    timer_.expires_at(deadline);
+    auto self = shared_from_this();
+    timer_.async_wait([self](asio::error_code ec) {
+        if (!ec && !self->done_)
+            self->cancel(asio::error::timed_out);
+    });
+    if (conn_->socket.is_open())
+        next();
+    else
+        connect();
+}
+void ClientSession::connect()
+{
+    auto self = shared_from_this();
+    pending_  = true;
+    resolver_.async_resolve(
+        conn_->host,
+        std::to_string(conn_->port),
+        [self](asio::error_code ec, asio::ip::tcp::resolver::results_type addresses) {
+            if (!self->checked(ec))
+                return;
+            self->pending_ = true;
+            asio::async_connect(
+                self->conn_->socket, addresses, [self](asio::error_code error, const asio::ip::tcp::endpoint&) {
+                    if (!self->checked(error))
+                        return;
+                    self->conn_->socket.set_option(asio::ip::tcp::no_delay(true), error);
+                    if (error)
+                        self->finish(error);
+                    else
+                        self->next();
+                });
+        });
+}
+bool ClientSession::checked(asio::error_code ec)
+{
+    pending_ = false;
+    if (forced_)
+        ec = forced_;
+    if (ec) {
+        finish(ec);
+        return false;
+    }
+    return true;
+}
+void ClientSession::next()
+{
+    if (index_ == transfers_.size()) {
+        finish({});
+        return;
+    }
+    const auto& transfer = transfers_[index_];
+    const auto  len      = transfer.header.size;
+    void*       ptr      = reinterpret_cast<void*>(transfer.local);
+    device_memory_       = is_device(ptr);
+    try {
+        if (device_memory_) {
+            staging_.resize(len);
+            if (transfer.header.opcode != OP_READ && !copy_to_host(staging_.data(), ptr, len)) {
+                finish(asio::error::fault);
+                return;
+            }
+            ptr = staging_.data();
+        }
+        wire_header_      = transfer.header;
+        wire_header_.size = htole64(wire_header_.size);
+        wire_header_.addr = htole64(wire_header_.addr);
+        auto self         = shared_from_this();
+        pending_          = true;
+        if (transfer.header.opcode == OP_READ) {
+            asio::async_write(conn_->socket,
+                              asio::buffer(&wire_header_, sizeof(wire_header_)),
+                              [self, ptr, len](asio::error_code ec, size_t) {
+                                  if (!self->checked(ec))
+                                      return;
+                                  self->pending_ = true;
+                                  asio::async_read(
+                                      self->conn_->socket,
+                                      asio::buffer(ptr, len),
+                                      [self](asio::error_code error, size_t) { self->payloadDone(error); });
+                              });
+        }
+        else {
+            std::array<asio::const_buffer, 2> buffers{asio::buffer(&wire_header_, sizeof(wire_header_)),
+                                                      asio::buffer(ptr, len)};
+            asio::async_write(conn_->socket, buffers, [self](asio::error_code ec, size_t) { self->payloadDone(ec); });
+        }
+    }
+    catch (...) {
+        pending_ = false;
+        finish(asio::error::no_memory);
+    }
+}
+void ClientSession::payloadDone(asio::error_code ec)
+{
+    if (!checked(ec))
+        return;
+    const auto& transfer = transfers_[index_];
+    if (device_memory_ && transfer.header.opcode == OP_READ
+        && !copy_to_device(reinterpret_cast<void*>(transfer.local), staging_.data(), transfer.header.size)) {
+        finish(asio::error::fault);
+        return;
+    }
+    ++index_;
+    next();
+}
+void ClientSession::cancel(asio::error_code reason)
+{
+    if (done_)
+        return;
+    forced_ = reason;
+    resolver_.cancel();
+    asio::error_code ignored;
+    conn_->socket.close(ignored);
+    if (!pending_)
+        finish(reason);
+}
+void ClientSession::finish(asio::error_code ec)
+{
+    if (done_)
+        return;
+    done_ = true;
+    asio::error_code ignored;
+    timer_.cancel();
+    if (ec)
+        conn_->socket.close(ignored);
+    if (on_done_)
+        on_done_(ec);
+}
+}  // namespace dlslime::tcp

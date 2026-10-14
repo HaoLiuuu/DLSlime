@@ -9,6 +9,7 @@ namespace tcp {
 
 int32_t TcpMemoryPool::register_memory_region(uintptr_t addr, size_t length, const std::string& name)
 {
+    std::lock_guard<std::mutex> lock(mu_);
 
     if (name.empty()) {
         SLIME_LOG_WARN("TcpMemoryPool: empty name rejected");
@@ -38,6 +39,7 @@ int32_t TcpMemoryPool::register_memory_region(uintptr_t addr, size_t length, con
 
 int32_t TcpMemoryPool::unregister_memory_region(int32_t handle)
 {
+    std::lock_guard<std::mutex> lock(mu_);
     if (handle < 0 || static_cast<size_t>(handle) >= handle_to_mr_.size())
         return -1;
 
@@ -60,6 +62,7 @@ int32_t TcpMemoryPool::unregister_memory_region(int32_t handle)
 
 int32_t TcpMemoryPool::register_remote_memory_region(const json& mr_info, std::optional<std::string> name)
 {
+    std::lock_guard<std::mutex> lock(mu_);
 
     std::string mr_name = name.value_or(mr_info.value("name", ""));
 
@@ -84,6 +87,7 @@ int32_t TcpMemoryPool::register_remote_memory_region(const json& mr_info, std::o
 
 int32_t TcpMemoryPool::unregister_remote_memory_region(int32_t handle)
 {
+    std::lock_guard<std::mutex> lock(mu_);
     if (handle < 0 || static_cast<size_t>(handle) >= remote_handle_to_mr_.size())
         return -1;
     auto& s = remote_handle_to_name_[handle];
@@ -98,6 +102,7 @@ int32_t TcpMemoryPool::unregister_remote_memory_region(int32_t handle)
 
 TcpMr TcpMemoryPool::get_mr_fast(int32_t handle) const
 {
+    std::lock_guard<std::mutex> lock(mu_);
     if (handle < 0 || static_cast<size_t>(handle) >= handle_to_mr_.size())
         return {};
     return handle_to_mr_[handle];
@@ -105,6 +110,7 @@ TcpMr TcpMemoryPool::get_mr_fast(int32_t handle) const
 
 TcpMr TcpMemoryPool::get_remote_mr_fast(int32_t handle) const
 {
+    std::lock_guard<std::mutex> lock(mu_);
     if (handle < 0 || static_cast<size_t>(handle) >= remote_handle_to_mr_.size())
         return {};
     return remote_handle_to_mr_[handle];
@@ -112,13 +118,15 @@ TcpMr TcpMemoryPool::get_remote_mr_fast(int32_t handle) const
 
 int32_t TcpMemoryPool::get_mr_handle(const std::string& name) const
 {
-    auto it = name_to_handle_.find(name);
+    std::lock_guard<std::mutex> lock(mu_);
+    auto                        it = name_to_handle_.find(name);
     return it != name_to_handle_.end() ? it->second : -1;
 }
 
 int32_t TcpMemoryPool::get_remote_mr_handle(const std::string& name) const
 {
-    auto it = remote_name_to_handle_.find(name);
+    std::lock_guard<std::mutex> lock(mu_);
+    auto                        it = remote_name_to_handle_.find(name);
     return it != remote_name_to_handle_.end() ? it->second : -1;
 }
 
@@ -126,7 +134,8 @@ int32_t TcpMemoryPool::get_remote_mr_handle(const std::string& name) const
 
 json TcpMemoryPool::mr_info() const
 {
-    json j = json::object();
+    std::lock_guard<std::mutex> lock(mu_);
+    json                        j = json::object();
     for (const auto& [name, h] : name_to_handle_)
         if (h >= 0 && static_cast<size_t>(h) < handle_to_mr_.size() && handle_to_mr_[h].length > 0)
             j[name] = handle_to_mr_[h].json_info(name);
@@ -135,11 +144,21 @@ json TcpMemoryPool::mr_info() const
 
 json TcpMemoryPool::remote_mr_info() const
 {
-    json j = json::object();
+    std::lock_guard<std::mutex> lock(mu_);
+    json                        j = json::object();
     for (const auto& [name, h] : remote_name_to_handle_)
         if (h >= 0 && static_cast<size_t>(h) < remote_handle_to_mr_.size() && remote_handle_to_mr_[h].length > 0)
             j[name] = remote_handle_to_mr_[h].json_info(name);
     return j;
+}
+
+bool TcpMemoryPool::contains(uintptr_t addr, size_t length) const
+{
+    std::lock_guard<std::mutex> lock(mu_);
+    for (const auto& mr : handle_to_mr_)
+        if (mr.addr && addr >= mr.addr && addr - mr.addr <= mr.length && length <= mr.length - (addr - mr.addr))
+            return true;
+    return false;
 }
 
 }  // namespace tcp

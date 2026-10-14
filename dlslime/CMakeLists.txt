@@ -65,6 +65,7 @@ endif()
 
 
 if (BUILD_TEST)
+    enable_testing()
     add_subdirectory(tests/cpp)
 endif (BUILD_TEST)
 
