@@ -445,6 +445,7 @@ static void serve(const std::string& ip, const std::string& manifest)
     send_json(socket, ep->endpoint_info());
     auto result = receive_json(socket);
     CHECK(result["passed"].get<bool>());
+    ep->shutdown();  // Join the writer before inspecting its destination from this thread.
     CHECK(source == sink);
     send_json(socket, {{"passed", true}});
     std::cout << "cross-host server passed\n";
