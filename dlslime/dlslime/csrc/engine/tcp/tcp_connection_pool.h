@@ -1,65 +1,34 @@
 #pragma once
-
 #include <asio.hpp>
 #include <chrono>
-#include <cstdint>
-#include <deque>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
+#include <utility>
+#include <vector>
 
-namespace dlslime {
-namespace tcp {
-
+namespace dlslime::tcp {
 struct PooledConnection {
     asio::ip::tcp::socket                 socket;
     std::string                           host;
-    uint16_t                              port{0};
-    std::chrono::steady_clock::time_point last_used;
+    uint16_t                              port;
+    std::chrono::steady_clock::time_point last_used{std::chrono::steady_clock::now()};
     bool                                  in_use{true};
-
-    PooledConnection(asio::ip::tcp::socket s, std::string h, uint16_t p):
-        socket(std::move(s)), host(std::move(h)), port(p), last_used(std::chrono::steady_clock::now())
-    {
-    }
+    PooledConnection(asio::io_context& io, std::string h, uint16_t p): socket(io), host(std::move(h)), port(p) {}
 };
 
-// Keyed by (host, port).  Thread-safe.
-// States: IDLE (in deque, in_use=false) / ACTIVE (checked out) / RESERVED
+// All methods run on the owning io_context thread. A checked-out connection
+// remains in the pool and its socket never moves into a per-request session.
 class TcpConnectionPool {
 public:
     static constexpr std::chrono::seconds kIdleTimeout{300};
-
-    explicit TcpConnectionPool(asio::io_context& io_ctx): io_ctx_(io_ctx) {}
-
+    explicit TcpConnectionPool(asio::io_context& io): io_ctx_(io) {}
     std::shared_ptr<PooledConnection> getConnection(const std::string& host, uint16_t port);
-
-    void returnConnection(std::shared_ptr<PooledConnection> conn);
-
-    void cleanupIdleConnections(bool lock = true);
-    void clear();
+    void                              returnConnection(std::shared_ptr<PooledConnection> conn);
+    void                              cleanupIdleConnections();
+    void                              clear();
 
 private:
-    struct ConnKey {
-        std::string host;
-        uint16_t    port;
-        bool        operator==(const ConnKey& o) const
-        {
-            return host == o.host && port == o.port;
-        }
-    };
-    struct ConnKeyHash {
-        size_t operator()(const ConnKey& k) const
-        {
-            return std::hash<std::string>{}(k.host) ^ (std::hash<uint16_t>{}(k.port) << 1);
-        }
-    };
-
-    asio::io_context&                                                                       io_ctx_;
-    std::mutex                                                                              mu_;
-    std::unordered_map<ConnKey, std::deque<std::shared_ptr<PooledConnection>>, ConnKeyHash> pool_;
+    asio::io_context&                              io_ctx_;
+    std::vector<std::shared_ptr<PooledConnection>> pool_;
 };
-
-}  // namespace tcp
-}  // namespace dlslime
+}  // namespace dlslime::tcp

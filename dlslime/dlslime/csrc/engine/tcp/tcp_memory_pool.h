@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -41,10 +42,12 @@ public:
     int32_t get_mr_handle(const std::string& name) const;
     int32_t get_remote_mr_handle(const std::string& name) const;
 
+    bool contains(uintptr_t addr, size_t length) const;
     json mr_info() const;
     json remote_mr_info() const;
 
 private:
+    mutable std::mutex mu_;
     // local MRs
     std::unordered_map<std::string, int32_t> name_to_handle_;
     std::unordered_map<uintptr_t, int32_t>   ptr_to_handle_;

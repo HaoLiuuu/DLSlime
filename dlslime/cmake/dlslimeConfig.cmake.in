@@ -1,5 +1,18 @@
 @PACKAGE_INIT@
 
+if(@BUILD_TCP@)
+    include(CMakeFindDependencyMacro)
+    find_dependency(Threads)
+    if(NOT TARGET asio::asio)
+        add_library(asio::asio INTERFACE IMPORTED)
+        set_target_properties(asio::asio PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${PACKAGE_PREFIX_DIR}/include/dlslime/third_party/asio"
+            INTERFACE_COMPILE_DEFINITIONS ASIO_STANDALONE
+            INTERFACE_LINK_LIBRARIES Threads::Threads)
+    endif()
+endif()
+
+
 include("${CMAKE_CURRENT_LIST_DIR}/dlslimeTargets.cmake")
 
 if(@USE_CUDA@)

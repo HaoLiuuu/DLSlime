@@ -1,30 +1,19 @@
 #include "tcp_context.h"
 
-namespace dlslime {
-namespace tcp {
-
-TcpContext::TcpContext()
-{
-    // Keep io_context alive even when there's no work posted yet.
-    auto work  = asio::make_work_guard(io_ctx_);
-    io_thread_ = std::thread([this, w = std::move(work)]() { io_ctx_.run(); });
-}
-
+namespace dlslime::tcp {
+TcpContext::TcpContext(): io_thread_([this] { io_ctx_.run(); }) {}
 TcpContext::~TcpContext()
 {
     shutdown();
 }
-
 void TcpContext::shutdown()
 {
-    if (!running_)
+    if (!io_thread_.joinable())
         return;
-    running_ = false;
-    io_ctx_.stop();
-    if (io_thread_.joinable())
-        io_thread_.join();
-    conn_pool_.clear();
+    asio::post(io_ctx_, [this] {
+        conn_pool_.clear();
+        work_.reset();
+    });
+    io_thread_.join();
 }
-
-}  // namespace tcp
-}  // namespace dlslime
+}  // namespace dlslime::tcp
