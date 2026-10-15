@@ -29,9 +29,11 @@ public:
     json         endpoint_info() const;
     void         connect(const json& remote_endpoint_info);
     void         shutdown();
-    int32_t      register_memory_region(const std::string& name, uintptr_t ptr, uintptr_t offset, size_t length);
-    int32_t      register_remote_memory_region(const std::string& name, const json& mr_info);
-    json         mr_info() const;
+    // Snapshot per submission. Depth 1 preserves the serial READ path.
+    void    set_read_pipeline_limits(size_t max_requests, size_t max_bytes);
+    int32_t register_memory_region(const std::string& name, uintptr_t ptr, uintptr_t offset, size_t length);
+    int32_t register_remote_memory_region(const std::string& name, const json& mr_info);
+    json    mr_info() const;
     std::shared_ptr<TcpSendFuture>      send(const chunk_tuple_t& chunk, int64_t timeout_ms = kDefaultTimeoutMs);
     std::shared_ptr<TcpRecvFuture>      recv(const chunk_tuple_t& chunk, bool exact_size = false);
     std::shared_ptr<TcpReadWriteFuture> read(const std::vector<assign_tuple_t>& assign,
@@ -77,6 +79,7 @@ private:
     std::atomic<bool>           connected_{false};
     std::atomic<bool>           running_{true};
     mutable std::mutex          api_mu_;
+    ReadPipelineLimits          read_limits_;
     std::unique_ptr<TcpContext> own_ctx_;
     asio::ip::tcp::acceptor     acceptor_;
     std::shared_ptr<TcpMemoryPool> local_pool_{std::make_shared<TcpMemoryPool>()};

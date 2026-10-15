@@ -1,10 +1,10 @@
 # TCP DRAM benchmark
 
-This benchmark calls the production PR01 `TcpEndpoint`, using standalone Asio 1.36.0. It measures HOST memory only, without accelerator copies, RDMA, vLLM, or SGLang.
+This benchmark calls the production `TcpEndpoint`, using standalone Asio 1.36.0. It measures HOST memory only, without accelerator copies, RDMA, vLLM, or SGLang.
 
 ## Measurement contract
 
-- Two independent processes, each with an endpoint and its I/O thread. Each initiator has exactly one outstanding batch and one persistent outgoing connection. Batch size counts spans in one assignment. PR01 advances spans serially, with a separate header per span; batch size is not connection count or queue depth.
+- Two independent processes, each with an endpoint and its I/O thread. Each initiator has exactly one outstanding batch and one persistent outgoing connection. Batch size counts spans in one assignment. HOST READ batches pipeline ordered span requests on that connection, with a separate legacy header per span. The default window is 32 requests and 8 MiB of requested but not fully received payload; batch size is not connection count or the in-flight window. WRITE/SEND remain serial at the span level.
 - Default per-span sizes: 1 KiB, 16 KiB, 256 KiB, 1 MiB, 4 MiB, 16 MiB. Batches: 1, 4, 16, 64. The maximum batch is 1 GiB. Four buffers plus guards require about 4 GiB per process, or 8 GiB for a loopback pair at the largest point.
 - Six modes: READ initiated by A, B, or both simultaneously; WRITE initiated by A, B, or both simultaneously. READ initiated by A carries data B to A. WRITE initiated by A carries data A to B.
 - Each point has 50 valid repetitions, each with a separate 1-second warmup and at least 3 measured seconds. The final complete batch can extend the interval. Case order uses a fixed random seed; repetitions within a case are contiguous. These are shared-machine repeated measurements, not independent machine samples.
@@ -33,6 +33,14 @@ Use the actual management interface and kind (`metax`, `ascend`, `h200`). The lo
 For a correctness smoke, add `--rounds 1 --warmup 0.05 --seconds 0.1 --sizes 1024 262144 16777216 --batches 1 64`. These short rates are not steady-state results.
 
 For cross-host testing, start the peer with `--serve --bind-ip <peer-address>` in its designated container. Securely copy its `peer-private.json` to the controller container; it contains a per-run secret and must not be published. Start the controller with `--remote <private-manifest> --bind-ip <controller-address>`. The peer accepts one authenticated controller and only bounded benchmark commands. Use a trusted test network: the legacy TCP data protocol is not authenticated or encrypted.
+
+## READ pipeline controls
+
+Use `--read-window 1` for the serial READ control, or `--read-window 32 --read-window-bytes 8388608` for the defaults. Limits apply per submitted batch/connection, not across the endpoint. A span larger than the byte budget runs alone, so the budget is a credit limit rather than a strict allocation cap. Requests are refilled as ordered responses finish; responses go directly into the caller's registered HOST buffers. A single-span batch retains the serial path. Device destinations also retain the existing staging path.
+
+Both settings are recorded in metadata, checked on resume, and forwarded to both benchmark endpoints at setup. For a controlled comparison, use the same Release binary, sizes, affinities, duration and repetitions with separate result directories. Observe background load and alternate configuration order where possible. Batch p50/p99 remains the time to receive the entire READ batch; it is not per-span network RTT.
+
+The C++ and Python endpoint API is `set_read_pipeline_limits(max_requests, max_bytes)`. Values are validated (1..4096 requests, 1..1 GiB bytes) and snapshotted when each operation is submitted. Changing the setting affects later operations. The wire protocol and server response order are unchanged; a pipelined client can use an existing sequential server.
 
 ## Workload gate and recovery
 

@@ -57,11 +57,20 @@ struct TcpTransfer {
     SessionHeader header;
     uintptr_t     local;
 };
+// Credits count requested but not yet completely received HOST READ spans.
+// A single span larger than max_bytes is admitted alone to guarantee progress.
+struct ReadPipelineLimits {
+    size_t max_requests{32};
+    size_t max_bytes{8 * 1024 * 1024};
+};
 class ClientSession: public std::enable_shared_from_this<ClientSession> {
 public:
     using DoneCallback = std::function<void(asio::error_code)>;
     using Deadline     = std::chrono::steady_clock::time_point;
-    ClientSession(asio::io_context& io, std::shared_ptr<PooledConnection> conn, DoneCallback done);
+    ClientSession(asio::io_context&                 io,
+                  std::shared_ptr<PooledConnection> conn,
+                  DoneCallback                      done,
+                  ReadPipelineLimits                limits = {});
     // Empty transfers establish a connection. A batch uses one connection and
     // completes after all spans retire, including the last span beyond 32.
     void start(std::vector<TcpTransfer> transfers, Deadline deadline);
@@ -70,6 +79,9 @@ public:
 private:
     void                              connect();
     void                              next();
+    void                              pumpRead();
+    void                              issueReadHeaders();
+    void                              receiveReadBody();
     void                              payloadDone(asio::error_code ec);
     void                              finish(asio::error_code ec);
     bool                              checked(asio::error_code ec);
@@ -82,8 +94,18 @@ private:
     SessionHeader                     wire_header_{};
     std::vector<char>                 staging_;
     bool                              device_memory_{false};
-    bool                              pending_{false};
-    bool                              done_{false};
-    asio::error_code                  forced_;
+    // At most one composed read and one composed write can be active together.
+    // Completion/connection reuse waits for BOTH callbacks to retire.
+    size_t                     pending_{0};
+    ReadPipelineLimits         read_limits_;
+    bool                       pipeline_read_{false};
+    bool                       headers_pending_{false};
+    bool                       body_pending_{false};
+    size_t                     requested_{0};
+    size_t                     received_{0};
+    size_t                     read_bytes_inflight_{0};
+    std::vector<SessionHeader> read_headers_;
+    bool                       done_{false};
+    asio::error_code           forced_;
 };
 }  // namespace dlslime::tcp

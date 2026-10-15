@@ -243,7 +243,9 @@ int main(int argc, char** argv)
                             && size <= (1ULL << 30) / count,
                         "size/batch out of bounds");
                 peer.reset();
-                peer            = std::make_unique<Peer>(cmd.at("bind_ip").get<std::string>(), size, count);
+                peer = std::make_unique<Peer>(cmd.at("bind_ip").get<std::string>(), size, count);
+                peer->ep->set_read_pipeline_limits(cmd.value("read_window", size_t{32}),
+                                                   cmd.value("read_window_bytes", size_t{8 * 1024 * 1024}));
                 out["endpoint"] = peer->ep->endpoint_info();
             }
             else if (action == "close") {

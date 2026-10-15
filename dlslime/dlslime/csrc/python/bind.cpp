@@ -596,6 +596,11 @@ PYBIND11_MODULE(_slime_c, m)
         .def("mr_info", &dlslime::tcp::TcpMemoryPool::mr_info);
 
     py::class_<dlslime::tcp::TcpEndpoint, std::shared_ptr<dlslime::tcp::TcpEndpoint>>(m, "TcpEndpoint")
+        .def("set_read_pipeline_limits",
+             &dlslime::tcp::TcpEndpoint::set_read_pipeline_limits,
+             py::arg("max_requests"),
+             py::arg("max_bytes"),
+             "Bound in-flight HOST READ spans; depth 1 selects the serial path.")
         .def(py::init<const std::string&, uint16_t>(), py::arg("ip") = "0.0.0.0", py::arg("port") = 0)
         .def("connect",
              &dlslime::tcp::TcpEndpoint::connect,
