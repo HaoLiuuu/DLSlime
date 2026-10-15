@@ -1,4 +1,5 @@
 #include <endian.h>
+#include <poll.h>
 
 #include <array>
 #include <cstdlib>
@@ -416,6 +417,161 @@ static void cancel_concurrent_reads()
         CHECK(worker.get() == TCP_CLOSED);
     peer.join();
 }
+
+static bool readable(Socket& socket, int timeout_ms)
+{
+    pollfd     fd{socket.native_handle(), POLLIN, 0};
+    const auto result = ::poll(&fd, 1, timeout_ms);
+    CHECK(result >= 0);
+    return result > 0;
+}
+static SessionHeader bounded_header(Socket& socket)
+{
+    CHECK(readable(socket, 2000));
+    return header(socket);
+}
+static void read_pipeline_window(size_t depth, size_t byte_limit, size_t span, size_t count)
+{
+    const size_t capacity = std::min({depth, std::max(size_t{1}, byte_limit / span), count});
+    RawPeer      peer([&](RawPeer& p) {
+        auto   socket    = p.accept();
+        size_t requested = 0;
+        auto   request   = [&] {
+            auto h = bounded_header(socket);
+            CHECK(h.opcode == OP_READ && h.size == span && h.addr == 4096 + requested * span);
+            ++requested;
+        };
+        // A serial implementation cannot pass: responses are withheld until
+        // the entire allowed request window has reached the remote peer.
+        for (size_t i = 0; i < capacity; ++i)
+            request();
+        CHECK(!readable(socket, 20));
+        for (size_t i = 0; i < count; ++i) {
+            std::vector<unsigned char> data(span, static_cast<unsigned char>(i % 251));
+            // Fragment responses to exercise composed reads and stream framing.
+            asio::write(socket, asio::buffer(data.data(), 1));
+            asio::write(socket, asio::buffer(data.data() + 1, data.size() - 1));
+            if (requested < count)
+                request();  // One returned credit must refill before the window drains.
+        }
+        // Reuse the connection after all response buffers and headers retire.
+        auto h = bounded_header(socket);
+        CHECK(h.opcode == OP_READ && h.size == 1);
+        asio::write(socket, asio::buffer("Z", 1));
+    });
+    auto         client = endpoint();
+    client->set_read_pipeline_limits(depth, byte_limit);
+    client->connect(peer.info());
+    std::vector<unsigned char> output(span * count + 2, 255);
+    auto l = client->register_memory_region("out", reinterpret_cast<uintptr_t>(output.data()), 0, output.size());
+    auto r = client->register_remote_memory_region("source", {{"addr", 4096}, {"length", span * count}});
+    std::vector<assign_tuple_t> spans;
+    for (size_t i = 0; i < count; ++i)
+        spans.emplace_back(l, r, i * span, i * span + 1, span);
+    CHECK(wait(client->read(spans, 5000)) == TCP_SUCCESS);
+    CHECK(output.front() == 255 && output.back() == 255);
+    for (size_t i = 0; i < count; ++i)
+        for (size_t j = 0; j < span; ++j)
+            CHECK(output[1 + i * span + j] == i % 251);
+    CHECK(wait(client->read({{l, r, 0, 1, 1}})) == TCP_SUCCESS);
+    CHECK(output[1] == 'Z');
+    peer.join();
+}
+static void read_pipeline_failure(int failure)
+{
+    std::promise<void> reached;
+    RawPeer            peer([&](RawPeer& p) {
+        auto socket = p.accept();
+        for (int i = 0; i < 8; ++i)
+            CHECK(bounded_header(socket).size == 8);
+        reached.set_value();
+        if (!failure) {
+            asio::write(socket, asio::buffer("12345678abc", 11));
+            return;  // Complete first response, truncated second, six missing.
+        }
+        CHECK(readable(socket, 3000));
+        char             byte{};
+        asio::error_code ec;
+        socket.read_some(asio::buffer(&byte, 1), ec);
+        CHECK(ec);
+    });
+    auto               ep = endpoint();
+    ep->set_read_pipeline_limits(8, 64);
+    ep->connect(peer.info());
+    std::vector<unsigned char> output(64, 255);
+    auto l = ep->register_memory_region("out", reinterpret_cast<uintptr_t>(output.data()), 0, output.size());
+    auto r = ep->register_remote_memory_region("remote", {{"addr", 4096}, {"length", 64}});
+    std::vector<assign_tuple_t> spans;
+    for (size_t i = 0; i < 8; ++i)
+        spans.emplace_back(l, r, i * 8, i * 8, 8);
+    auto f = ep->read(spans, failure == 1 ? 250 : 5000);
+    CHECK(reached.get_future().wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    if (failure == 2)
+        ep->shutdown();
+    CHECK(wait(f) == (failure == 0 ? TCP_FAILED : failure == 1 ? TCP_TIMEOUT : TCP_CLOSED));
+    output.clear();
+    output.shrink_to_fit();  // ASan checks no late writes after completion.
+    ep->shutdown();
+    peer.join();
+}
+static void cancel_both_pipeline_directions()
+{
+    asio::io_context        io;
+    asio::ip::tcp::acceptor acceptor(io, {asio::ip::make_address("127.0.0.1"), 0});
+    auto conn = std::make_shared<PooledConnection>(io, "127.0.0.1", acceptor.local_endpoint().port());
+    conn->socket.connect(acceptor.local_endpoint());
+    auto                     peer = acceptor.accept();
+    std::vector<char>        output(64, 0);
+    std::vector<TcpTransfer> spans;
+    for (size_t i = 0; i < 64; ++i)
+        spans.push_back({{1, 4096 + i, OP_READ}, reinterpret_cast<uintptr_t>(&output[i])});
+    size_t completions = 0;
+    auto   session     = std::make_shared<ClientSession>(io, conn, [&](asio::error_code ec) {
+        CHECK(ec == asio::error::operation_aborted);
+        ++completions;
+        output.clear();
+        output.shrink_to_fit();
+    });
+    session->start(std::move(spans), std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    // Both composed operations have been initiated but neither completion
+    // handler has run. Cancellation must not notify before both handlers retire.
+    session->cancel();
+    CHECK(completions == 0);
+    session.reset();
+    io.run();
+    CHECK(completions == 1);
+}
+static void overlapping_and_zero_read_spans()
+{
+    auto                 client = endpoint(), server = endpoint();
+    std::array<char, 12> source{'A', 'A', 'A', 'A', 'B', 'B', 'B', 'B', 'C', 'C', 'C', 'C'};
+    std::array<char, 6>  output{'G', '?', '?', '?', '?', 'G'};
+    server->register_memory_region("source", reinterpret_cast<uintptr_t>(source.data()), 0, source.size());
+    auto l = client->register_memory_region("out", reinterpret_cast<uintptr_t>(output.data()), 0, output.size());
+    client->connect(server->endpoint_info());
+    auto r = client->register_remote_memory_region("remote", server->mr_info()["source"]);
+    CHECK(wait(client->read(
+              {{l, r, 0, 1, 0}, {l, r, 0, 1, 4}, {l, r, 4, 1, 0}, {l, r, 4, 1, 4}, {l, r, 8, 1, 4}, {l, r, 12, 5, 0}}))
+          == TCP_SUCCESS);
+    CHECK(output.front() == 'G' && output.back() == 'G');
+    for (size_t i = 1; i < 5; ++i)
+        CHECK(output[i] == 'C');
+}
+static void read_pipeline_invalid_limits()
+{
+    auto ep = endpoint();
+    for (auto [count, bytes] : {std::pair<size_t, size_t>{0, 1}, {4097, 1}, {1, 0}, {1, (size_t{1} << 30) + 1}}) {
+        bool caught = false;
+        try {
+            ep->set_read_pipeline_limits(count, bytes);
+        }
+        catch (const std::invalid_argument&) {
+            caught = true;
+        }
+        CHECK(caught);
+    }
+    ep->set_read_pipeline_limits(1, 1);
+}
 static json receive_json(Socket& socket)
 {
     asio::streambuf buffer;
@@ -490,6 +646,16 @@ int main(int argc, char** argv)
             std::cout << "PASS " << name << std::endl;
         };
         run("future waiters", state_waiters);
+        run("READ request window and rolling refill", [] { read_pipeline_window(4, 1024, 8, 37); });
+        run("READ byte credits", [] { read_pipeline_window(8, 24, 8, 17); });
+        run("READ oversized span forward progress", [] { read_pipeline_window(8, 4, 8, 7); });
+        run("READ depth one control", [] { read_pipeline_window(1, 1024, 8, 7); });
+        run("READ pipelined partial EOF", [] { read_pipeline_failure(0); });
+        run("READ pipelined timeout", [] { read_pipeline_failure(1); });
+        run("READ pipelined shutdown", [] { read_pipeline_failure(2); });
+        run("READ cancellation with two active directions", cancel_both_pipeline_directions);
+        run("READ overlapping destinations and zero spans", overlapping_and_zero_read_spans);
+        run("READ pipeline invalid limits", read_pipeline_invalid_limits);
         run("delayed executor and backpressured header", delayed_header);
         for (size_t count : {31, 32, 33, 1000}) {
             batch_last_span(count);

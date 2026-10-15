@@ -184,6 +184,7 @@ def metadata(args):
             'binary_sha256': hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
             'kernel': platform.release(), 'numa_policy': 'first touch; per-process CPU affinity',
             'outstanding_batches_per_initiator': 1, 'rounds': args.rounds,
+            'read_window': args.read_window, 'read_window_bytes': args.read_window_bytes,
             'warmup_seconds': args.warmup, 'measure_seconds': args.seconds,
             'span_sizes': args.sizes, 'batch_sizes': args.batches,
             'loopback': args.remote is None, 'guard_stable_seconds': args.stable_seconds,
@@ -264,7 +265,7 @@ def matrix(args, monitor, out):
     meta_path = out / 'metadata.json'
     if meta_path.exists():
         previous = json.loads(meta_path.read_text())
-        for key in ['source_sha256', 'binary_sha256', 'cpus_a', 'cpus_b', 'rounds', 'warmup_seconds', 'measure_seconds', 'case_order', 'loopback', 'transport_sha256']:
+        for key in ['source_sha256', 'binary_sha256', 'cpus_a', 'cpus_b', 'rounds', 'warmup_seconds', 'measure_seconds', 'case_order', 'loopback', 'transport_sha256', 'read_window', 'read_window_bytes']:
             if previous[key] != meta[key]:
                 raise RuntimeError('resume configuration changed: ' + key)
         if previous.get('peer') and previous['peer']['binary_sha256'] != meta['peer']['binary_sha256']:
@@ -284,7 +285,8 @@ def matrix(args, monitor, out):
                     if all(x['ready'] for x in current):
                         break
                     time.sleep(5)
-                setup = {'command': 'setup', 'span_bytes': size, 'batch_size': batch, 'bind_ip': args.bind_ip}
+                setup = {'command': 'setup', 'span_bytes': size, 'batch_size': batch, 'bind_ip': args.bind_ip,
+                         'read_window': args.read_window, 'read_window_bytes': args.read_window_bytes}
                 ia, ib = both(setup)
                 both({'command': 'connect', 'endpoint': ib['endpoint']}, {'command': 'connect', 'endpoint': ia['endpoint']})
                 for n in range(args.rounds):
@@ -339,6 +341,8 @@ def main():
     parser.add_argument('--bind-ip', default='127.0.0.1')
     parser.add_argument('--cpus-a', default='2,3')
     parser.add_argument('--cpus-b', default='4,5')
+    parser.add_argument('--read-window', type=int, default=32)
+    parser.add_argument('--read-window-bytes', type=int, default=8 * 1024 * 1024)
     parser.add_argument('--rounds', type=int, default=50)
     parser.add_argument('--warmup', type=float, default=1)
     parser.add_argument('--seconds', type=float, default=3)
@@ -349,6 +353,8 @@ def main():
     parser.add_argument('--serve', action='store_true')
     parser.add_argument('--lock', default='/opt/dlslime-dev/tcp-benchmark.lock')
     args = parser.parse_args()
+    if not 1 <= args.read_window <= 4096 or not 1 <= args.read_window_bytes <= 2**30:
+        parser.error('invalid READ pipeline limits')
     if not 1 <= args.rounds <= 10000 or not 0 < args.warmup <= 60 or not 0 < args.seconds <= 60:
         parser.error('invalid rounds or duration')
     if any(s < 8 or s % 8 or s * b > 2**30 or b < 1 or b > 4096 for s in args.sizes for b in args.batches):

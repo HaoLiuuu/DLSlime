@@ -102,6 +102,15 @@ int32_t TcpEndpoint::register_remote_memory_region(const std::string& name, cons
 {
     return remote_pool_->register_remote_memory_region(info, name);
 }
+void TcpEndpoint::set_read_pipeline_limits(size_t max_requests, size_t max_bytes)
+{
+    if (!max_requests || max_requests > 4096 || !max_bytes || max_bytes > (size_t{1} << 30))
+        throw std::invalid_argument("TCP READ pipeline requires 1..4096 requests and 1..1 GiB bytes");
+    std::lock_guard<std::mutex> lock(api_mu_);
+    if (!running_)
+        throw std::runtime_error("TCP endpoint is closed");
+    read_limits_ = {max_requests, max_bytes};
+}
 void TcpEndpoint::submit(std::vector<TcpTransfer>           transfers,
                          const std::shared_ptr<TcpOpState>& op,
                          int64_t                            timeout_ms,
@@ -115,22 +124,26 @@ void TcpEndpoint::submit(std::vector<TcpTransfer>           transfers,
         std::chrono::duration_cast<std::chrono::milliseconds>(ClientSession::Deadline::max() - now).count();
     const auto deadline =
         timeout_ms >= max_ms ? ClientSession::Deadline::max() : now + std::chrono::milliseconds(timeout_ms);
-    asio::post(own_ctx_->io_context(), [this, transfers = std::move(transfers), op, host, port, deadline]() mutable {
-        if (!running_) {
-            op->complete(TCP_CLOSED);
-            return;
-        }
-        auto& pool = own_ctx_->conn_pool();
-        auto  conn = pool.getConnection(host, port);
-        auto  session =
-            std::make_shared<ClientSession>(own_ctx_->io_context(), conn, [this, conn, op](asio::error_code ec) {
-                own_ctx_->conn_pool().returnConnection(conn);
-                clients_.erase(conn.get());
-                op->complete(status(ec));
-            });
-        clients_.emplace(conn.get(), session);
-        session->start(std::move(transfers), deadline);
-    });
+    asio::post(own_ctx_->io_context(),
+               [this, transfers = std::move(transfers), op, host, port, deadline, limits = read_limits_]() mutable {
+                   if (!running_) {
+                       op->complete(TCP_CLOSED);
+                       return;
+                   }
+                   auto& pool    = own_ctx_->conn_pool();
+                   auto  conn    = pool.getConnection(host, port);
+                   auto  session = std::make_shared<ClientSession>(
+                       own_ctx_->io_context(),
+                       conn,
+                       [this, conn, op](asio::error_code ec) {
+                           own_ctx_->conn_pool().returnConnection(conn);
+                           clients_.erase(conn.get());
+                           op->complete(status(ec));
+                       },
+                       limits);
+                   clients_.emplace(conn.get(), session);
+                   session->start(std::move(transfers), deadline);
+               });
 }
 std::shared_ptr<TcpSendFuture> TcpEndpoint::send(const chunk_tuple_t& chunk, int64_t timeout_ms)
 {

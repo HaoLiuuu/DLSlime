@@ -32,3 +32,14 @@ Coverage includes a backpressured header with a delayed executor, a deliberately
 For a functional two-host READ/WRITE smoke test, start `tcp_regression --serve <existing-management-IP> <manifest-file>` in one container. The manifest contains the dynamically selected control port. Run `tcp_regression --client <server-IP> <control-port>` in the other. Swap roles for the second direction. The test uses a same-connection READ after WRITE to verify the destination; it is not a bandwidth benchmark or a claim of remote completion for legacy WRITE.
 
 Current cross-host acceptance is MetaX to/from Ascend on the existing 25 Gb/s management network. H200 runs local tests while its cross-host network is unavailable. This PR neither registers Ascend HBM with IBVerbs nor changes host networking, drivers, or vendor environments.
+
+
+## Bounded HOST READ pipelining
+
+Multi-span HOST READ batches use a rolling window on one pooled connection. The client can send later request headers while an earlier response is arriving. It keeps one composed Asio write and one composed Asio read active at most, and receives complete responses in request order. This preserves overlapping destination-span ordering and the existing wire protocol. The server requires no protocol changes.
+
+The default credits are 32 outstanding spans and 8 MiB of requested but not fully received payload. An oversized span is admitted alone for forward progress. `TcpEndpoint::set_read_pipeline_limits(max_requests, max_bytes)` (also exposed in Python) snapshots limits per submission; depth 1 selects the serial control. Single-span batches and batches with device destinations retain the serial path. This change does not implement asynchronous HBM staging or increase the number of outstanding API batches.
+
+The session owns all encoded headers until the write callback retires. Success, failure, timeout and shutdown wait for both active I/O callbacks before completing the Future or recycling the connection. The first cancellation reason is retained. Caller buffers must remain alive until actual operation completion, including after an unsuccessful `wait_for`. Response buffers are not allocated per outstanding request.
+
+The HOST regression includes a peer that withholds all responses until a full request window arrives, byte-credit and oversized-span cases, rolling refill, fragmented responses, partial EOF, deadline, shutdown, overlapping/zero-length destinations, and cancellation with both I/O directions active. The benchmark supports depth-1 versus pipelined comparisons without changing its timed loop or correctness checks.

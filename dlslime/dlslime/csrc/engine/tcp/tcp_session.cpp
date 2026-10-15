@@ -197,13 +197,21 @@ void ServerSession::writeBody(const void* src, size_t len)
     });
 }
 
-ClientSession::ClientSession(asio::io_context& io, std::shared_ptr<PooledConnection> conn, DoneCallback done):
-    conn_(std::move(conn)), resolver_(io), timer_(io), on_done_(std::move(done))
+ClientSession::ClientSession(asio::io_context&                 io,
+                             std::shared_ptr<PooledConnection> conn,
+                             DoneCallback                      done,
+                             ReadPipelineLimits                limits):
+    conn_(std::move(conn)), resolver_(io), timer_(io), on_done_(std::move(done)), read_limits_(limits)
 {
 }
 void ClientSession::start(std::vector<TcpTransfer> transfers, Deadline deadline)
 {
     transfers_ = std::move(transfers);
+    pipeline_read_ =
+        read_limits_.max_requests > 1 && transfers_.size() > 1
+        && std::all_of(transfers_.begin(), transfers_.end(), [](const TcpTransfer& transfer) {
+               return transfer.header.opcode == OP_READ && !is_device(reinterpret_cast<void*>(transfer.local));
+           });
     if (deadline <= std::chrono::steady_clock::now()) {
         finish(asio::error::timed_out);
         return;
@@ -222,47 +230,62 @@ void ClientSession::start(std::vector<TcpTransfer> transfers, Deadline deadline)
 void ClientSession::connect()
 {
     auto self = shared_from_this();
-    pending_  = true;
-    resolver_.async_resolve(
-        conn_->host,
-        std::to_string(conn_->port),
-        [self](asio::error_code ec, asio::ip::tcp::resolver::results_type addresses) {
-            if (!self->checked(ec))
-                return;
-            self->pending_ = true;
-            asio::async_connect(
-                self->conn_->socket, addresses, [self](asio::error_code error, const asio::ip::tcp::endpoint&) {
-                    if (!self->checked(error))
-                        return;
-                    self->conn_->socket.set_option(asio::ip::tcp::no_delay(true), error);
-                    if (error)
-                        self->finish(error);
-                    else
-                        self->next();
-                });
-        });
+    ++pending_;
+    try {
+        resolver_.async_resolve(
+            conn_->host,
+            std::to_string(conn_->port),
+            [self](asio::error_code ec, asio::ip::tcp::resolver::results_type addresses) {
+                if (!self->checked(ec))
+                    return;
+                ++self->pending_;
+                try {
+                    asio::async_connect(
+                        self->conn_->socket, addresses, [self](asio::error_code error, const asio::ip::tcp::endpoint&) {
+                            if (!self->checked(error))
+                                return;
+                            self->conn_->socket.set_option(asio::ip::tcp::no_delay(true), error);
+                            if (error)
+                                self->finish(error);
+                            else
+                                self->next();
+                        });
+                }
+                catch (...) {
+                    --self->pending_;
+                    self->cancel(asio::error::no_memory);
+                }
+            });
+    }
+    catch (...) {
+        --pending_;
+        cancel(asio::error::no_memory);
+    }
 }
 bool ClientSession::checked(asio::error_code ec)
 {
-    pending_ = false;
-    if (forced_)
-        ec = forced_;
-    if (ec) {
-        finish(ec);
+    --pending_;
+    if (forced_ || ec) {
+        cancel(forced_ ? forced_ : ec);
         return false;
     }
     return true;
 }
 void ClientSession::next()
 {
+    if (pipeline_read_) {
+        pumpRead();
+        return;
+    }
     if (index_ == transfers_.size()) {
         finish({});
         return;
     }
-    const auto& transfer = transfers_[index_];
-    const auto  len      = transfer.header.size;
-    void*       ptr      = reinterpret_cast<void*>(transfer.local);
-    device_memory_       = is_device(ptr);
+    const auto& transfer      = transfers_[index_];
+    const auto  len           = transfer.header.size;
+    void*       ptr           = reinterpret_cast<void*>(transfer.local);
+    device_memory_            = is_device(ptr);
+    const auto pending_before = pending_;
     try {
         if (device_memory_) {
             staging_.resize(len);
@@ -276,18 +299,24 @@ void ClientSession::next()
         wire_header_.size = htole64(wire_header_.size);
         wire_header_.addr = htole64(wire_header_.addr);
         auto self         = shared_from_this();
-        pending_          = true;
+        ++pending_;
         if (transfer.header.opcode == OP_READ) {
             asio::async_write(conn_->socket,
                               asio::buffer(&wire_header_, sizeof(wire_header_)),
                               [self, ptr, len](asio::error_code ec, size_t) {
                                   if (!self->checked(ec))
                                       return;
-                                  self->pending_ = true;
-                                  asio::async_read(
-                                      self->conn_->socket,
-                                      asio::buffer(ptr, len),
-                                      [self](asio::error_code error, size_t) { self->payloadDone(error); });
+                                  ++self->pending_;
+                                  try {
+                                      asio::async_read(
+                                          self->conn_->socket,
+                                          asio::buffer(ptr, len),
+                                          [self](asio::error_code error, size_t) { self->payloadDone(error); });
+                                  }
+                                  catch (...) {
+                                      --self->pending_;
+                                      self->cancel(asio::error::no_memory);
+                                  }
                               });
         }
         else {
@@ -297,8 +326,92 @@ void ClientSession::next()
         }
     }
     catch (...) {
-        pending_ = false;
-        finish(asio::error::no_memory);
+        pending_ = pending_before;
+        cancel(asio::error::no_memory);
+    }
+}
+void ClientSession::pumpRead()
+{
+    if (done_ || forced_)
+        return;
+    if (received_ == transfers_.size()) {
+        if (!pending_)
+            finish({});
+        return;
+    }
+    // Each direction has exactly one composed operation at a time. Issuing
+    // headers and receiving bodies progress independently on the same socket.
+    if (!headers_pending_)
+        issueReadHeaders();
+    if (!done_ && !forced_ && !body_pending_ && received_ < requested_)
+        receiveReadBody();
+}
+void ClientSession::issueReadHeaders()
+{
+    try {
+        read_headers_.clear();
+        while (requested_ < transfers_.size() && requested_ - received_ < read_limits_.max_requests) {
+            const auto& transfer = transfers_[requested_];
+            const auto  bytes    = transfer.header.size;
+            if (requested_ != received_
+                && (read_bytes_inflight_ > read_limits_.max_bytes
+                    || bytes > read_limits_.max_bytes - read_bytes_inflight_))
+                break;
+            auto wire = transfer.header;
+            wire.size = htole64(wire.size);
+            wire.addr = htole64(wire.addr);
+            read_headers_.push_back(wire);
+            ++requested_;
+            read_bytes_inflight_ += bytes;
+        }
+    }
+    catch (...) {
+        cancel(asio::error::no_memory);
+        return;
+    }
+    if (read_headers_.empty())
+        return;
+    auto self        = shared_from_this();
+    headers_pending_ = true;
+    ++pending_;
+    try {
+        // The vector is session-owned and never changed before this callback.
+        asio::async_write(conn_->socket, asio::buffer(read_headers_), [self](asio::error_code ec, size_t) {
+            self->headers_pending_ = false;
+            if (self->checked(ec))
+                self->pumpRead();
+        });
+    }
+    catch (...) {
+        headers_pending_ = false;
+        --pending_;
+        cancel(asio::error::no_memory);
+    }
+}
+void ClientSession::receiveReadBody()
+{
+    const auto& transfer = transfers_[received_];
+    auto        self     = shared_from_this();
+    body_pending_        = true;
+    ++pending_;
+    try {
+        // Legacy responses are ordered byte streams. Retiring one entire body
+        // before selecting the next buffer also preserves overlapping spans.
+        asio::async_read(conn_->socket,
+                         asio::buffer(reinterpret_cast<void*>(transfer.local), transfer.header.size),
+                         [self](asio::error_code ec, size_t) {
+                             self->body_pending_ = false;
+                             if (!self->checked(ec))
+                                 return;
+                             self->read_bytes_inflight_ -= self->transfers_[self->received_].header.size;
+                             ++self->received_;
+                             self->pumpRead();
+                         });
+    }
+    catch (...) {
+        body_pending_ = false;
+        --pending_;
+        cancel(asio::error::no_memory);
     }
 }
 void ClientSession::payloadDone(asio::error_code ec)
@@ -318,16 +431,17 @@ void ClientSession::cancel(asio::error_code reason)
 {
     if (done_)
         return;
-    forced_ = reason;
+    if (!forced_)
+        forced_ = reason;
     resolver_.cancel();
     asio::error_code ignored;
     conn_->socket.close(ignored);
     if (!pending_)
-        finish(reason);
+        finish(forced_);
 }
 void ClientSession::finish(asio::error_code ec)
 {
-    if (done_)
+    if (done_ || pending_)
         return;
     done_ = true;
     asio::error_code ignored;
