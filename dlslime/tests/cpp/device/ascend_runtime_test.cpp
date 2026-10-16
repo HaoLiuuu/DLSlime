@@ -6,6 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 #include "dlslime/csrc/device/runtime/device_runtime.h"
@@ -51,25 +52,25 @@ int main(int argc, char** argv)
         void* host = std::malloc(65536);
         check(host, "malloc");
         {
-            dlslime::RDMAEndpoint endpoint(argv[1], 1, "RoCE", 2);
+            auto endpoint = std::make_shared<dlslime::RDMAEndpoint>(argv[1], 1, "RoCE", 2);
             auto                  before = calls();
             rejected([&] {
-                endpoint.registerOrAccessMemoryRegion("forbidden.hbm", reinterpret_cast<uintptr_t>(hbm), 0, 4096);
+                endpoint->registerOrAccessMemoryRegion("forbidden.hbm", reinterpret_cast<uintptr_t>(hbm), 0, 4096);
             });
             check(calls() == before && blocked() == 0, "HBM reached the verbs registration boundary");
-            rejected([&] { endpoint.registerOrAccessMemoryRegion("overflow", UINTPTR_MAX, 64, 4096); });
+            rejected([&] { endpoint->registerOrAccessMemoryRegion("overflow", UINTPTR_MAX, 64, 4096); });
             auto hole = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             check(hole != MAP_FAILED, "mmap");
             rejected(
-                [&] { endpoint.registerOrAccessMemoryRegion("unknown", reinterpret_cast<uintptr_t>(hole), 0, 4096); });
+                [&] { endpoint->registerOrAccessMemoryRegion("unknown", reinterpret_cast<uintptr_t>(hole), 0, 4096); });
             munmap(hole, 4096);
             check(calls() == before, "UNKNOWN/overflow reached verbs");
-            auto first = endpoint.registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 4096);
+            auto first = endpoint->registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 4096);
             check(first >= 0 && calls() == before + 1, "HOST registration did not reach real verbs");
-            check(endpoint.registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 4096) == first
+            check(endpoint->registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 4096) == first
                       && calls() == before + 1,
                   "cached HOST registration changed");
-            endpoint.shutdown();
+            endpoint->shutdown();
         }
         std::free(host);
         auto rt = DeviceRuntime::create(Backend::Ascend, 0);
