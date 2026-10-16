@@ -8,3 +8,9 @@ if(DLSLIME_RUNTIME_CUDA)
 endif()
 add_test(NAME device_runtime_host COMMAND device_runtime_test host)
 # Real accelerator tests are explicitly selected after checking business load.
+
+if(DLSLIME_RUNTIME_MACA)
+    add_executable(maca_runtime_test maca_runtime_test.cpp)
+    target_include_directories(maca_runtime_test PRIVATE ${DLSLIME_MACA_INCLUDE})
+    target_link_libraries(maca_runtime_test PRIVATE _slime_device ${DLSLIME_MACA_LIBRARY})
+endif()

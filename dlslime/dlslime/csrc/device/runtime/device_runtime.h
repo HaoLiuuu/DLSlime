@@ -46,6 +46,7 @@ struct PointerInfo {
     bool       owned = false, range_known = false;
 };
 namespace detail {
+struct DmaBufState;
 struct AllocationState;
 struct StreamState;
 struct EventState;
@@ -115,8 +116,22 @@ private:
     std::shared_ptr<detail::StreamState> state_;
     friend class DeviceRuntime;
 };
+class DmaBuf {
+  public:
+    DmaBuf() = default;
+    int fd() const; // Borrowed descriptor. Keep this owner alive; do not close it.
+    size_t offset() const;
+    size_t size() const;
+    size_t exportedSize() const;
+    size_t granularity() const;
+  private:
+    explicit DmaBuf(std::shared_ptr<detail::DmaBufState> state) : state_(std::move(state)) {}
+    std::shared_ptr<detail::DmaBufState> state_;
+    friend class DeviceRuntime;
+};
 class DeviceRuntime {
 public:
+    DmaBuf exportDmaBuf(const BufferView& view) const;
     static DeviceRuntime create(Backend backend, int device = 0);
     DeviceInfo           deviceInfo() const;
     Capabilities         capabilities() const;
