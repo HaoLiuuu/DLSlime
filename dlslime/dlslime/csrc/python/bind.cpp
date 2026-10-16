@@ -107,8 +107,15 @@ namespace py = pybind11;
 
 #define EXPOSE_BUILD_FLAG(m, flag) m.attr("_" #flag) = flag##_ENABLED
 
+#ifdef BUILD_TCP
+void bind_region_tcp(py::module_&);
+#endif
+
 PYBIND11_MODULE(_slime_c, m)
 {
+#ifdef BUILD_TCP
+    bind_region_tcp(m);
+#endif
     EXPOSE_BUILD_FLAG(m, BUILD_RDMA);
     EXPOSE_BUILD_FLAG(m, BUILD_NVLINK);
     EXPOSE_BUILD_FLAG(m, BUILD_INTRA_OPS);

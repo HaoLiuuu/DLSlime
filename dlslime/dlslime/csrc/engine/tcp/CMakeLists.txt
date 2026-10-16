@@ -6,6 +6,7 @@ add_library(_slime_tcp SHARED
     tcp_context.cpp
     tcp_session.cpp
     tcp_endpoint.cpp
+    tcp_region_endpoint.cpp
 )
 
 target_compile_definitions(_slime_tcp PRIVATE ASIO_STANDALONE)
@@ -25,10 +26,12 @@ target_link_libraries(_slime_tcp PUBLIC
 
 set_target_properties(_slime_tcp PROPERTIES
     BUILD_WITH_INSTALL_RPATH TRUE
-    INSTALL_RPATH "${ORIGIN}"
+    INSTALL_RPATH "\${ORIGIN}"
 )
 
 install(TARGETS _slime_tcp
     EXPORT dlslimeTargets
     LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
 )
+
+install(FILES tcp_region_endpoint.h region_wire.h tcp_op_state.h DESTINATION include/dlslime/csrc/engine/tcp)

@@ -6,6 +6,9 @@ find_package(pybind11 REQUIRED PATHS ${pybind11_DIR})
 set(PYTHON_SUPPORTED_VERSIONS "3.8" "3.9" "3.10" "3.11" "3.12")
 
 set(_slime_c_sources bind.cpp)
+if(BUILD_TCP)
+    list(APPEND _slime_c_sources region_tcp_bindings.cpp)
+endif()
 
 # DLSlimeCache (V0): pure C++ + STL, no RDMA dependency. Sources baked
 # into the python extension so they can use pybind11 directly. See

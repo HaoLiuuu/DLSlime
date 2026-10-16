@@ -40,6 +40,20 @@ void TcpConnectionPool::cleanupIdleConnections()
                                }),
                 pool_.end());
 }
+void TcpConnectionPool::trimIdleConnections(size_t max_idle)
+{
+    size_t idle = 0;
+    pool_.erase(std::remove_if(pool_.begin(),
+                               pool_.end(),
+                               [&](const auto& c) {
+                                   if (c->in_use || idle++ < max_idle)
+                                       return false;
+                                   asio::error_code ignored;
+                                   c->socket.close(ignored);
+                                   return true;
+                               }),
+                pool_.end());
+}
 void TcpConnectionPool::clear()
 {
     for (auto& c : pool_) {

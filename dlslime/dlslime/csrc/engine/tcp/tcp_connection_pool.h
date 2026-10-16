@@ -25,6 +25,7 @@ public:
     std::shared_ptr<PooledConnection> getConnection(const std::string& host, uint16_t port);
     void                              returnConnection(std::shared_ptr<PooledConnection> conn);
     void                              cleanupIdleConnections();
+    void                              trimIdleConnections(size_t max_idle);
     void                              clear();
 
 private:

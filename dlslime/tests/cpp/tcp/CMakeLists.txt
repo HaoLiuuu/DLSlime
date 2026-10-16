@@ -10,7 +10,8 @@ set(TCP_ROOT "${DLSLIME_ROOT}/dlslime/csrc/engine/tcp")
 if(NOT TARGET _slime_tcp)
 add_library(tcp_under_test STATIC
     ${TCP_ROOT}/tcp_context.cpp ${TCP_ROOT}/tcp_connection_pool.cpp
-    ${TCP_ROOT}/tcp_memory_pool.cpp ${TCP_ROOT}/tcp_session.cpp ${TCP_ROOT}/tcp_endpoint.cpp)
+    ${TCP_ROOT}/tcp_memory_pool.cpp ${TCP_ROOT}/tcp_session.cpp ${TCP_ROOT}/tcp_endpoint.cpp
+    ${TCP_ROOT}/tcp_region_endpoint.cpp ${TCP_ROOT}/../region/host_region.cpp)
 target_include_directories(tcp_under_test PUBLIC ${DLSLIME_ROOT})
 target_link_libraries(tcp_under_test PUBLIC asio::asio)
 set(_tcp_test_library tcp_under_test)
@@ -27,3 +28,11 @@ target_link_libraries(tcp_regression PRIVATE ${_tcp_test_library} asio::asio)
 enable_testing()
 add_test(NAME tcp_regression COMMAND tcp_regression)
 set_tests_properties(tcp_regression PROPERTIES TIMEOUT 90)
+
+add_executable(tcp_region_regression tcp_region_regression.cpp)
+target_link_libraries(tcp_region_regression PRIVATE ${_tcp_test_library} asio::asio)
+add_test(NAME tcp_region_regression COMMAND tcp_region_regression)
+set_tests_properties(tcp_region_regression PROPERTIES TIMEOUT 90)
+
+add_executable(tcp_region_smoke tcp_region_smoke.cpp)
+target_link_libraries(tcp_region_smoke PRIVATE ${_tcp_test_library} asio::asio)
