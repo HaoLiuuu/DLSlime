@@ -1,0 +1,2 @@
+add_executable(rdma_correctness_smoke rdma_correctness_smoke.cpp)
+target_link_libraries(rdma_correctness_smoke PRIVATE _slime_rdma)
