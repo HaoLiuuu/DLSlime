@@ -182,7 +182,7 @@ def metadata(args):
             'transport_sha256': {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted(tcp.glob('*')) if f.is_file()},
             'source_sha256': {f: hashlib.sha256(Path(__file__).with_name(f).read_bytes()).hexdigest() for f in files},
             'binary_sha256': hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
-            'kernel': platform.release(), 'numa_policy': 'first touch; per-process CPU affinity',
+            'kernel': platform.release(), 'numa_policy': 'first touch; explicit two-CPU budget reapplied to every RDMA progress thread',
             'outstanding_batches_per_initiator': 1, 'rounds': args.rounds,
             'read_window': args.read_window, 'read_window_bytes': args.read_window_bytes,
             'warmup_seconds': args.warmup, 'measure_seconds': args.seconds,

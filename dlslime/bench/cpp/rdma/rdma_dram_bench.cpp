@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -17,6 +18,8 @@
 using namespace dlslime;
 using Clock                   = std::chrono::steady_clock;
 static constexpr size_t guard = 64;
+static cpu_set_t        requested_cpus;
+static bool             pin_requested = false;
 
 static void require(bool ok, const char* message)
 {
@@ -112,6 +115,15 @@ struct Peer {
         ep->connect(remote);
         remote_src = ep->registerOrAccessRemoteMemoryRegion("source", remote.at("mr_info").at("source"));
         remote_dst = ep->registerOrAccessRemoteMemoryRegion("target", remote.at("mr_info").at("target"));
+        // Production progress threads select a NUMA socket. Reapply this benchmark
+        // process's explicit CPU budget after those threads have initialized.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (pin_requested)
+            for (const auto& task : std::filesystem::directory_iterator("/proc/self/task"))
+                require(sched_setaffinity(
+                            std::stoi(task.path().filename().string()), sizeof(requested_cpus), &requested_cpus)
+                            == 0,
+                        "worker affinity failed");
     }
     void prepare(const json& cmd)
     {
@@ -227,6 +239,8 @@ int main(int argc, char** argv)
                 CPU_SET(n, &cpus);
             }
             require(sched_setaffinity(0, sizeof(cpus), &cpus) == 0, "CPU affinity failed");
+            requested_cpus = cpus;
+            pin_requested  = true;
         }
         else {
             require(argc == 1, "usage: rdma_dram_bench [--cpus comma-separated-CPUs]");
