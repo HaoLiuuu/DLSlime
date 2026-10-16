@@ -162,6 +162,11 @@ Lease HostRegionRegistry::acquire(const Key& key, uint64_t offset, uint64_t leng
     ++e->leases;
     return Lease(state_, e, reinterpret_cast<void*>(e->address + offset), static_cast<size_t>(length));
 }
+size_t HostRegionRegistry::active_leases(const Key& key) const
+{
+    std::lock_guard lock(state_->mutex);
+    return lookup(*state_, key)->leases;
+}
 Retirement HostRegionRegistry::retire(const Key& key)
 {
     std::shared_ptr<Entry> e;

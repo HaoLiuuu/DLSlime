@@ -99,6 +99,8 @@ public:
     Descriptor
           register_owned_host(std::shared_ptr<void> owner, void* address, size_t length, Access = Access::read_write);
     Lease acquire(const Key&, uint64_t offset, uint64_t length, Access);
+    // Diagnostic snapshot; it does not reserve admission or synchronize payload access.
+    size_t                  active_leases(const Key&) const;
     Retirement              retire(const Key&);
     std::vector<Retirement> close();
 
