@@ -1,0 +1,2 @@
+add_executable(rdma_dram_bench rdma_dram_bench.cpp)
+target_link_libraries(rdma_dram_bench PRIVATE _slime_rdma)
