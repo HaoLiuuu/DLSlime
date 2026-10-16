@@ -283,7 +283,7 @@ void validateVerbsRegistration(const void* pointer, size_t bytes)
 #ifdef DLSLIME_RUNTIME_ASCEND
     // Owned allocations allow exact range checks without consulting an optional
     // staging endpoint. Any accelerator allocation is forbidden in this build.
-    bool ownedHost = false;
+    bool ownedHost = false, ownedPinnedHost = false;
     {
         std::lock_guard<std::mutex> lock(registryMutex);
         auto                        it = registry.upper_bound(address);
@@ -295,7 +295,8 @@ void validateVerbsRegistration(const void* pointer, size_t bytes)
                             "Ascend transport requires DRAM staging; HBM verbs registration is forbidden");
                     require(bytes <= a->info.bytes - (address - a->info.base),
                             "verbs range exceeds its owned allocation");
-                    ownedHost = true;
+                    ownedHost       = true;
+                    ownedPinnedHost = a->info.kind == MemoryKind::HostPinned;
                 }
             }
         }
@@ -320,7 +321,11 @@ void validateVerbsRegistration(const void* pointer, size_t bytes)
             continue;
         require(lo <= cursor && permissions.size() >= 2 && permissions[0] == 'r' && permissions[1] == 'w',
                 "verbs range is not fully CPU-readable/writable HOST memory");
-        require(path.find("/dev/") == std::string::npos, "device-backed CPU mapping is not accepted as HOST DRAM");
+        // CANN pinned HOST allocations can be mapped through its device file.
+        // Trust only our exact owned allocation, never an external pointer hint
+        // or the mapped pathname alone. Unowned device mappings remain denied.
+        require(ownedPinnedHost || path.find("/dev/") == std::string::npos,
+                "unowned device-backed mapping is not proven HOST DRAM");
         uintptr_t stop = std::min(end, hi);
         if (!ownedHost)
             for (uintptr_t p : {cursor, stop - 1}) {

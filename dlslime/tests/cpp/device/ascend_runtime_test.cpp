@@ -53,7 +53,7 @@ int main(int argc, char** argv)
         check(host, "malloc");
         {
             auto endpoint = std::make_shared<dlslime::RDMAEndpoint>(argv[1], 1, "RoCE", 2);
-            auto                  before = calls();
+            auto before   = calls();
             rejected([&] {
                 endpoint->registerOrAccessMemoryRegion("forbidden.hbm", reinterpret_cast<uintptr_t>(hbm), 0, 4096);
             });
@@ -79,6 +79,16 @@ int main(int argc, char** argv)
         check(info.kind == MemoryKind::Device && !info.owned, "external Ascend HBM classification");
         auto pinned = rt.allocate(4096, MemoryKind::HostPinned);
         validateVerbsRegistration(pinned.data(), pinned.size());
+        {
+            auto endpoint = std::make_shared<dlslime::RDMAEndpoint>(argv[1], 1, "RoCE", 2);
+            auto before   = calls();
+            check(endpoint->registerOrAccessMemoryRegion(
+                      "pinned.host", reinterpret_cast<uintptr_t>(pinned.data()), 0, pinned.size())
+                          >= 0
+                      && calls() == before + 1,
+                  "owned pinned HOST registration did not reach real verbs");
+            endpoint->shutdown();
+        }
         auto owned = rt.allocate(4096, MemoryKind::Device);
         rejected([&] { validateVerbsRegistration(owned.data(), owned.size()); });
         aclrtContext after;

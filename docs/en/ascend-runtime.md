@@ -33,3 +33,9 @@ leases belong to PR06b.
 
 Ascend transport always stages through DRAM for TCP and generic verbs RDMA. This
 backend does not attempt an Ascend HBM ibv_reg_mr call or claim direct HBM RDMA.
+
+CANN pinned HOST memory may use a device-backed CPU mapping. The registration
+guard permits this only for a live, exact-range allocation owned by DeviceRuntime
+and classified as HostPinned at allocation. Unowned device mappings remain
+rejected, including caller-supplied HOST claims. A native test verifies that this
+owned pinned DRAM reaches the real verbs provider while HBM never does.
