@@ -3,6 +3,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,7 +33,7 @@ struct Samples {
     double              seconds = 0;
     std::vector<double> latency;
 };
-int main(int argc, char** argv)
+int runTrial(int argc, char** argv)
 {
     try {
         check(argc == 8, "usage: device_copy_bench backend device operation bytes batch warmup seconds");
@@ -108,4 +109,29 @@ int main(int argc, char** argv)
         std::cerr << "FAIL " << e.what() << '\n';
         return 1;
     }
+}
+
+int main(int argc, char** argv)
+{
+    if (argc < 2 || std::string(argv[1]) != "--serve")
+        return runTrial(argc, argv);
+    // Keep one worker PID for the full experiment so telemetry can identify it
+    // across a container PID namespace. Never infer ownership from GPU activity.
+    for (std::string line; std::getline(std::cin, line);) {
+        if (line == "exit")
+            return 0;
+        std::istringstream       input(line);
+        std::vector<std::string> words{"device_copy_bench"};
+        for (std::string word; input >> word;)
+            words.push_back(word);
+        std::vector<char*> args;
+        for (auto& word : words)
+            args.push_back(word.data());
+        if (runTrial(static_cast<int>(args.size()), args.data()) != 0) {
+            std::cout << "{\"error\":\"benchmark trial failed; inspect stderr\"}\n" << std::flush;
+            return 1;
+        }
+        std::cout << std::flush;
+    }
+    return 0;
 }
