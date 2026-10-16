@@ -2,6 +2,7 @@ add_library(
     _slime_engine
     SHARED
     assignment.cpp
+    region/host_region.cpp
 )
 
 set_target_properties(
@@ -38,3 +39,5 @@ endif()
 if (BUILD_TCP)
     add_subdirectory(tcp)
 endif()
+
+install(FILES region/host_region.h DESTINATION include/dlslime/csrc/engine/region)
