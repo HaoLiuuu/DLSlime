@@ -4,6 +4,7 @@
 #include <thread>
 
 #include "dlslime/csrc/engine/rdma/completion_tracker.h"
+#include "dlslime/csrc/engine/rdma/operation_progress.h"
 using dlslime::rdma_detail::CompletionTracker;
 #define CHECK(x)                                                                                                       \
     do {                                                                                                               \
@@ -230,6 +231,59 @@ void reentrant_quiesce()
     CHECK(t.quiesce(1, [] { return 0; }));
     CHECK(ac == 1 && bc == 1 && t.pending() == 0);
 }
+void operation_progress()
+{
+    using namespace dlslime::rdma_detail;
+    for (size_t qps : {1, 2, 31, 32}) {
+        RetirementCounter counter;
+        int               completed = 0;
+        counter.admit(qps);
+        for (size_t i = 0; i < qps; ++i)
+            completed += counter.retire();
+        CHECK(completed == 0);  // All current CQEs arrived while producer is still open.
+        counter.admit(qps * 3);
+        for (size_t i = 0; i < qps * 2; ++i)
+            completed += counter.retire();  // Later slots may finish first.
+        CHECK(completed == 0);
+        completed += counter.retire();  // Seal the producer.
+        CHECK(completed == 0);
+        for (size_t i = 0; i < qps; ++i)
+            completed += counter.retire();
+        CHECK(completed == 1);
+    }
+    CHECK(completionMask(1) == 1 && completionMask(31) == 0x7fffffffu && completionMask(32) == UINT32_MAX);
+    for (size_t qps : {0, 33, 64}) {
+        bool rejected = false;
+        try {
+            completionMask(qps);
+        }
+        catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
+    struct Slot {
+        const void* op;
+        bool        ready;
+        int         id;
+    };
+    int               a, b, c;
+    Slot              a0{&a, false, 0}, a1{&a, true, 1}, b0{&b, true, 2}, c0{&c, false, 3}, c1{&c, true, 4};
+    std::deque<Slot*> queue{&a0, &b0, &a1, &c0, &c1};
+    std::vector<int>  posted;
+    auto              progress = [&] {
+        return progressReadyQueue(
+            queue,
+            [](Slot* s) { return s->op; },
+            [](Slot* s) { return s->ready; },
+            [&](Slot* s) { posted.push_back(s->id); });
+    };
+    CHECK(progress() == 1 && posted == std::vector<int>{2});
+    a0.ready = true;
+    CHECK(progress() == 2 && (posted == std::vector<int>{2, 0, 1}));
+    c0.ready = true;
+    CHECK(progress() == 2 && (posted == std::vector<int>{2, 0, 1, 3, 4}) && queue.empty());
+}
 int main()
 {
     for (size_t n : {1, 2, 31, 32, 33, 64, 65, 257})
@@ -243,6 +297,7 @@ int main()
     malformed_provider();
     cq_retirement_race();
     reentrant_quiesce();
+    operation_progress();
     std::cout
-        << "PASS WR boundaries, partial post prefixes, early CQEs, failed quiesce, errors/multi-QP, unknown bad_wr, reentrant retirement, 100 CQ/destroy races\n";
+        << "PASS WR boundaries, partial post prefixes, early CQEs, failed quiesce, errors/multi-QP, unknown bad_wr, reentrant retirement, producer/slot/QP aggregation, ready-queue ordering, 100 CQ/destroy races\n";
 }

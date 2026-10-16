@@ -5,6 +5,7 @@
 #include <memory>
 
 #include "dlslime/csrc/device/signal.h"
+#include "operation_progress.h"
 #include "rdma_assignment.h"
 
 namespace dlslime {
@@ -33,12 +34,12 @@ struct EndpointOpState {
     std::shared_ptr<dlslime::device::DeviceSignal> signal;
 
     // Producer sentinel prevents completion while dispatch is still adding slots.
-    std::atomic<size_t>   pending_shards{1};
-    std::atomic<bool>     terminal{false};
-    uint32_t              expected_mask{0};
-    std::atomic<uint32_t> completion_mask{0};
-    std::atomic<int32_t>  completion_status{RDMAAssign::SUCCESS};
-    std::atomic<int32_t>  imm_data{0};
+    rdma_detail::RetirementCounter pending_shards;
+    std::atomic<bool>              terminal{false};
+    uint32_t                       expected_mask{0};
+    std::atomic<uint32_t>          completion_mask{0};
+    std::atomic<int32_t>           completion_status{RDMAAssign::SUCCESS};
+    std::atomic<int32_t>           imm_data{0};
 
     // Optional tracing for the imm-recv fast path. Zero if unused.
     std::atomic<uint64_t> trace_start_ns{0};

@@ -41,12 +41,7 @@ namespace dlslime {
 
 namespace {
 
-uint32_t qpMask(size_t count)
-{
-    if (!count || count > 32)
-        throw std::invalid_argument("RDMA requires 1..32 QPs");
-    return count == 32 ? UINT32_MAX : (uint32_t{1} << count) - 1;
-}
+using rdma_detail::completionMask;
 void publishTerminal(const std::shared_ptr<EndpointOpState>& op)
 {
     if (op->terminal.exchange(true, std::memory_order_acq_rel))
@@ -65,7 +60,7 @@ void publishTerminal(const std::shared_ptr<EndpointOpState>& op)
 }
 void retireShard(const std::shared_ptr<EndpointOpState>& op)
 {
-    if (op->pending_shards.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    if (op->pending_shards.retire())
         publishTerminal(op);
 }
 void setFailure(const std::shared_ptr<EndpointOpState>& op, int32_t status)
@@ -128,7 +123,7 @@ RDMAEndpoint::RDMAEndpoint(std::shared_ptr<RDMAContext> ctx, size_t num_qp, std:
 
 void RDMAEndpoint::init(std::shared_ptr<RDMAWorker> worker)
 {
-    qpMask(num_qp_);
+    completionMask(num_qp_);
     if (SLIME_MAX_SEND_WR <= 0 || SLIME_MAX_RECV_WR <= 0 || !SLIME_MAX_LENGTH_PER_ASSIGNMENT)
         throw std::invalid_argument("Invalid RDMA WR/chunk limits");
     if (not ctx_)
@@ -151,7 +146,6 @@ void RDMAEndpoint::init(std::shared_ptr<RDMAWorker> worker)
 
     // Aggregation logic is not supported in V0 Send/Recv mode.
     SLIME_ASSERT(1 == SLIME_AGG_QP_NUM, "cannot aggqp when sendrecv");
-    SLIME_ASSERT(64 > SLIME_QP_NUM, "QP NUM must less than 64");
 
     // ============================================================
     // Initialize meta_pool (per-endpoint, sys buffers, borrows PD from local_pool_)
@@ -559,7 +553,7 @@ ReadWriteContext* RDMAEndpoint::acquireReadWriteSlot()
     ReadWriteContext* ctx = static_cast<ReadWriteContext*>(landing[0]);
     ctx->token_charged.fill(false);
     ctx->slot_qp_mask.store(0, std::memory_order_relaxed);
-    ctx->slot_qp_expected = qpMask(num_qp_);
+    ctx->slot_qp_expected = completionMask(num_qp_);
     return ctx;
 }
 
@@ -573,7 +567,7 @@ SendContext* RDMAEndpoint::acquireSendSlot()
     }
     SendContext* ctx = static_cast<SendContext*>(landing[0]);
     ctx->slot_qp_mask.store(0, std::memory_order_relaxed);
-    ctx->slot_qp_expected = qpMask(num_qp_);
+    ctx->slot_qp_expected = completionMask(num_qp_);
     ctx->state_           = SendContextState::WAIT_GPU_READY;
     // NOTE: do NOT reset meta_arrived_flag_ here. The meta-recv RECV on
     // the meta channel is driven by the peer independently of our own
@@ -597,7 +591,7 @@ RecvContext* RDMAEndpoint::acquireRecvSlot()
     }
     RecvContext* ctx = static_cast<RecvContext*>(landing[0]);
     ctx->slot_qp_mask.store(0, std::memory_order_relaxed);
-    ctx->slot_qp_expected = qpMask(num_qp_);
+    ctx->slot_qp_expected = completionMask(num_qp_);
     ctx->state_           = RecvContextState::WAIT_GPU_BUF;
     return ctx;
 }
@@ -668,7 +662,7 @@ void RDMAEndpoint::dummyReset(ImmRecvContext* ctx)
 
 void RDMAEndpoint::postImmRecvSlot(ImmRecvContext* ctx)
 {
-    ctx->expected_mask = qpMask(num_qp_);
+    ctx->expected_mask = completionMask(num_qp_);
     ctx->finished_qp_mask.store(0, std::memory_order_release);
     ctx->completion_status.store(RDMAAssign::SUCCESS, std::memory_order_release);
     ctx->imm_data.store(0, std::memory_order_release);
@@ -788,7 +782,7 @@ int32_t RDMAEndpoint::dispatchTask(OpCode                             opcode,
     int32_t           last    = -1;
     ReadWriteContext* current = nullptr;
     bool              counted = false;
-    op->expected_mask         = qpMask(num_qp_);
+    op->expected_mask         = completionMask(num_qp_);
     if (op->signal) {
         op->signal->reset_all();
         op->signal->bind_stream(stream);
@@ -846,7 +840,7 @@ int32_t RDMAEndpoint::dispatchTask(OpCode                             opcode,
                     retireShard(op);
                 };
             }
-            op->pending_shards.fetch_add(num_qp_, std::memory_order_relaxed);
+            op->pending_shards.admit(num_qp_);
             counted = true;
             while (jring_enqueue_burst(read_write_buffer_ring_, reinterpret_cast<void**>(&current), 1, nullptr) == 0) {
                 if (closing_)
@@ -897,7 +891,7 @@ std::shared_ptr<SendFuture> RDMAEndpoint::send(const chunk_tuple_t& chunk, void*
     int32_t        handle = local_pool_->registerMemoryRegion(data_ptr, length);
     (void)handle;
 
-    uint32_t target_mask = qpMask(num_qp_);
+    uint32_t target_mask = completionMask(num_qp_);
 
     // Blocking slot acquire — the free ring guarantees that ctx is not
     // owned by any in-flight op.
@@ -940,7 +934,7 @@ std::shared_ptr<RecvFuture> RDMAEndpoint::recv(const chunk_tuple_t& chunk, void*
     storage_view_t view{data_ptr, offset, length};
     int32_t        handle = local_pool_->registerMemoryRegion(data_ptr, length);
 
-    uint32_t target_mask = qpMask(num_qp_);
+    uint32_t target_mask = completionMask(num_qp_);
 
     RecvContext* r_ctx = acquireRecvSlot();
 
@@ -980,7 +974,7 @@ std::shared_ptr<ReadWriteFuture> RDMAEndpoint::read(const std::vector<assign_tup
 {
     SubmissionGuard submission(*this);
     validateOneSided(assign);
-    auto op_state = makeOpState(qpMask(num_qp_), false, stream, /*trace_start=*/false);
+    auto op_state = makeOpState(completionMask(num_qp_), false, stream, /*trace_start=*/false);
 
     // Observability: anchor semantic accounting on op_state. The CQ
     // callback uses obs_completed.exchange(true) to record completion
@@ -1006,7 +1000,7 @@ std::shared_ptr<ReadWriteFuture> RDMAEndpoint::write(const std::vector<assign_tu
 {
     SubmissionGuard submission(*this);
     validateOneSided(assign);
-    auto op_state = makeOpState(qpMask(num_qp_), false, stream, /*trace_start=*/false);
+    auto op_state = makeOpState(completionMask(num_qp_), false, stream, /*trace_start=*/false);
 
     if (obs::obs_enabled()) {
         uint64_t total_bytes = 0;
@@ -1030,7 +1024,7 @@ RDMAEndpoint::writeWithImm(const std::vector<assign_tuple_t>& assign, int32_t im
 {
     SubmissionGuard submission(*this);
     validateOneSided(assign);
-    auto op_state = makeOpState(qpMask(num_qp_), false, stream, /*trace_start=*/false);
+    auto op_state = makeOpState(completionMask(num_qp_), false, stream, /*trace_start=*/false);
 
     if (obs::obs_enabled()) {
         uint64_t total_bytes = 0;
@@ -1060,7 +1054,7 @@ std::shared_ptr<ImmRecvFuture> RDMAEndpoint::immRecv(void* stream)
     // queued event, or wait in pending_imm_recv_ops_ until a future CQ event
     // arrives. It does not own a hardware receive slot; the transport-owned
     // slots stay permanently posted (RNR-avoidance window).
-    auto op_state = makeOpState(qpMask(num_qp_), false, stream, /*trace_start=*/SLIME_WITH_TIME_TRACE != 0);
+    auto op_state = makeOpState(completionMask(num_qp_), false, stream, /*trace_start=*/SLIME_WITH_TIME_TRACE != 0);
 
     std::optional<ImmRecvEvent> ready_event;
     {
@@ -1089,36 +1083,30 @@ std::shared_ptr<ImmRecvFuture> RDMAEndpoint::immRecv(void* stream)
 
 int32_t RDMAEndpoint::readWriteProcess()
 {
-    int       work  = 0;
     const int count = jring_dequeue_burst(read_write_buffer_ring_, io_burst_buf_, IO_BURST_SIZE, nullptr);
     for (int i = 0; i < count; ++i)
         pending_rw_queue_.push_back(static_cast<ReadWriteContext*>(io_burst_buf_[i]));
-    std::unordered_set<EndpointOpState*> blocked;
-    // One bounded pass. Skip unrelated unready producers, while retaining the
-    // original per-operation slot order and final WRITE_WITH_IMM ordering.
-    const size_t candidates = pending_rw_queue_.size();
-    for (size_t i = 0; i < candidates; ++i) {
-        auto* slot = pending_rw_queue_.front();
-        pending_rw_queue_.pop_front();
-        auto op    = slot->op_state;
-        bool ready = op && op->signal && op->signal->is_gpu_ready() && !blocked.count(op.get());
-        for (size_t q = 0; ready && q < num_qp_; ++q)
-            ready = token_bucket_[q].load(std::memory_order_acquire)
-                    >= static_cast<int32_t>(slot->assigns_[q].batch_.size());
-        if (!ready) {
-            blocked.insert(op.get());
-            pending_rw_queue_.push_back(slot);
-            continue;
-        }
-        ++work;
-        for (size_t q = 0; q < num_qp_; ++q) {
-            const auto n           = slot->assigns_[q].batch_.size();
-            slot->token_charged[q] = true;
-            token_bucket_[q].fetch_sub(n, std::memory_order_release);
-            io_data_channel_->post_rc_oneside_batch(q, &slot->assigns_[q], local_pool_);
-        }
-    }
-    return work;
+    return rdma_detail::progressReadyQueue(
+        pending_rw_queue_,
+        [](ReadWriteContext* slot) { return slot->op_state.get(); },
+        [&](ReadWriteContext* slot) {
+            auto op = slot->op_state;
+            if (!op || !op->signal || !op->signal->is_gpu_ready())
+                return false;
+            for (size_t q = 0; q < num_qp_; ++q)
+                if (token_bucket_[q].load(std::memory_order_acquire)
+                    < static_cast<int32_t>(slot->assigns_[q].batch_.size()))
+                    return false;
+            return true;
+        },
+        [&](ReadWriteContext* slot) {
+            for (size_t q = 0; q < num_qp_; ++q) {
+                const auto n           = slot->assigns_[q].batch_.size();
+                slot->token_charged[q] = true;
+                token_bucket_[q].fetch_sub(n, std::memory_order_release);
+                io_data_channel_->post_rc_oneside_batch(q, &slot->assigns_[q], local_pool_);
+            }
+        });
 }
 
 int32_t RDMAEndpoint::immRecvProcess()

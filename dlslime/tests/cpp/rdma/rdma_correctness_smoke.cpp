@@ -30,7 +30,8 @@ int main(int argc, char** argv)
     auto rh = a->registerOrAccessRemoteMemoryRegion("target", b->mrInfo().at("target"));
     auto lh = b->registerOrAccessRemoteMemoryRegion("source", a->mrInfo().at("source"));
     std::cout << "CONNECTED qps=" << qps << std::endl;
-    for (size_t count : {size_t(1), size_t(2), size_t(31), size_t(32), size_t(33), size_t(65), size_t(257)}) {
+    for (size_t count :
+         {size_t(1), size_t(2), size_t(31), size_t(32), size_t(33), size_t(65), size_t(257), size_t(1025)}) {
         for (size_t i = 0; i < source.size(); ++i)
             source[i] = static_cast<unsigned char>((i * 17 + count) % 251);
         std::fill(target.begin(), target.end(), 255);
@@ -70,8 +71,33 @@ int main(int argc, char** argv)
         CHECK(source == target);
     }
     std::cout << "PASS repeated SEND/RECV" << std::endl;
+    for (const auto& invalid : std::vector<std::vector<assign_tuple_t>>{{},
+                                                                        {{local, rh, 0, source.size(), 1}},
+                                                                        {{local, rh, target.size(), 0, 1}},
+                                                                        {{UINT64_MAX, rh, 0, 0, 1}},
+                                                                        {{local, rh, UINT64_MAX, 0, 2}}}) {
+        bool rejected = false;
+        try {
+            a->write(invalid, nullptr);
+        }
+        catch (const std::exception&) {
+            rejected = true;
+        }
+        CHECK(rejected);
+    }
+    std::cout << "PASS invalid batches rejected before posting" << std::endl;
     auto retained = a->write({assign_tuple_t{local, rh, 0, 0, 64}}, nullptr);
     CHECK(retained->wait() == 0);
+    // Fail only this test's QPs. A remote access error must retire all shards
+    // without poisoning an already completed Future.
+    auto invalid_key                       = b->mrInfo().at("target");
+    invalid_key["rkey"]                    = 0;
+    auto                        bad_handle = a->registerOrAccessRemoteMemoryRegion("invalid-test-key", invalid_key);
+    std::vector<assign_tuple_t> bad_spans;
+    for (size_t i = 0; i < 257; ++i)
+        bad_spans.emplace_back(local, bad_handle, i * 64, i * 64, 64);
+    CHECK(a->write(bad_spans, nullptr)->wait() != 0);
+    std::cout << "PASS remote access error retires every shard" << std::endl;
     auto pending = b->immRecv();
     a->shutdown();
     b->shutdown();
