@@ -1,2 +1,7 @@
 add_executable(rdma_correctness_smoke rdma_correctness_smoke.cpp)
 target_link_libraries(rdma_correctness_smoke PRIVATE _slime_rdma)
+
+add_executable(rdma_completion_tracker_test completion_tracker_test.cpp)
+target_link_libraries(rdma_completion_tracker_test PRIVATE _slime_rdma)
+add_test(NAME rdma_completion_tracker_test COMMAND rdma_completion_tracker_test)
+set_tests_properties(rdma_completion_tracker_test PROPERTIES TIMEOUT 60)

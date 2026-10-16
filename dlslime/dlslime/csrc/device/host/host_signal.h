@@ -47,7 +47,7 @@ public:
 
     void set_comm_done(int qp_index) override
     {
-        uint32_t bit = (1 << qp_index);
+        uint32_t bit = (uint32_t{1} << qp_index);
         SLIME_LOG_INFO("set comm done: ", bit);
         flags_->comm_done.fetch_or(bit, std::memory_order_release);
     }

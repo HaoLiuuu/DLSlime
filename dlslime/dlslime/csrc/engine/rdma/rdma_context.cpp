@@ -1,5 +1,6 @@
 #include "rdma_context.h"
 
+#include <arpa/inet.h>
 #include <infiniband/verbs.h>
 #include <numa.h>
 #include <poll.h>
@@ -42,6 +43,9 @@ RDMAContext::~RDMAContext()
     if (cq_)
         ibv_destroy_cq(cq_);
 
+    if (comp_channel_)
+        ibv_destroy_comp_channel(comp_channel_);
+
     if (ib_ctx_)
         ibv_close_device(ib_ctx_);
 
@@ -69,6 +73,7 @@ int64_t RDMAContext::init(const std::string& dev_name, uint8_t ib_port, const st
 
     if (!num_devices) {
         SLIME_LOG_ERROR("No RDMA devices found.")
+        ibv_free_device_list(dev_list);
         return -1;
     }
 
@@ -91,6 +96,7 @@ int64_t RDMAContext::init(const std::string& dev_name, uint8_t ib_port, const st
         ib_ctx_ = ibv_open_device(dev_list[0]);
     }
 
+    ibv_free_device_list(dev_list);
     if (!ib_ctx_) {
         SLIME_ABORT("Failed to open the default device");
     }
@@ -212,34 +218,16 @@ int64_t RDMAContext::cq_poll_handle()
 
     auto process_wcs = [&](int nr_poll, struct ibv_wc* wc) {
         for (int i = 0; i < nr_poll; ++i) {
-            RDMAAssign::CALLBACK_STATUS status_code = RDMAAssign::SUCCESS;
-
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                status_code = RDMAAssign::FAILED;
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
-                    SLIME_LOG_ERROR("WR failed: ", ibv_wc_status_str(wc[i].status), ", Vendor Err: ", wc[i].vendor_err);
-
-                    if (wc[i].wr_id != 0) {
-                        RDMAAssign* assign = reinterpret_cast<RDMAAssign*>(wc[i].wr_id);
-                        SLIME_LOG_ERROR("Failed WR ID: " << (void*)assign);
-                    }
-
-                    // Observability: record CQ error (real failure, not flush)
-                    obs::obs_record_cq_error(obs_nic_id_);
-                }
+            const bool success = wc[i].status == IBV_WC_SUCCESS;
+            if (!success && wc[i].status != IBV_WC_WR_FLUSH_ERR) {
+                SLIME_LOG_ERROR("WR failed: ", ibv_wc_status_str(wc[i].status), ", vendor: ", wc[i].vendor_err);
+                obs::obs_record_cq_error(obs_nic_id_);
             }
-
-            if (wc[i].wr_id != 0) {
-                RDMAAssign* assign = reinterpret_cast<RDMAAssign*>(wc[i].wr_id);
-
-                // Semantic completion accounting is owned by the
-                // EndpointOpState-level callback below (exchange-guarded for
-                // once-only semantics). CQ polling only records CQ-level
-                // error signals.
-                if (assign->callback_) {
-                    assign->callback_(status_code, wc[i].imm_data);
-                }
-            }
+            // On an error CQE, opcode/flags/imm_data are undefined. Only inspect
+            // immediate data after success and the explicit WITH_IMM flag.
+            const int32_t imm =
+                success && (wc[i].wc_flags & IBV_WC_WITH_IMM) ? static_cast<int32_t>(ntohl(wc[i].imm_data)) : 0;
+            completions_.complete(wc[i].wr_id, success ? RDMAAssign::SUCCESS : RDMAAssign::FAILED, imm);
         }
     };
 

@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 
+#include "completion_tracker.h"
 #include "dlslime/csrc/common/json.hpp"
 #include "rdma_assignment.h"
 
@@ -52,6 +53,7 @@ public:
     }
 
 private:
+    rdma_detail::CompletionTracker   completions_;
     inline static constexpr int      UNDEFINED_QPI            = -1;
     inline static constexpr uint32_t UNDEFINED_IMM_DATA       = -1;
     inline static constexpr uint32_t BACKPRESSURE_BUFFER_SIZE = 8192;

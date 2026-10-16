@@ -32,6 +32,9 @@ namespace dlslime {
 struct EndpointOpState {
     std::shared_ptr<dlslime::device::DeviceSignal> signal;
 
+    // Producer sentinel prevents completion while dispatch is still adding slots.
+    std::atomic<size_t>   pending_shards{1};
+    std::atomic<bool>     terminal{false};
     uint32_t              expected_mask{0};
     std::atomic<uint32_t> completion_mask{0};
     std::atomic<int32_t>  completion_status{RDMAAssign::SUCCESS};

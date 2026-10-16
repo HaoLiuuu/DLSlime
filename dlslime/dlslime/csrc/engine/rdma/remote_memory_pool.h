@@ -88,6 +88,7 @@ public:
     // Get Remote MR by Handle (Fast Path)
     inline remote_mr_t get_remote_mr_fast(int32_t handle)
     {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (handle >= 0 && handle < handle_to_mr_.size()) {
             return handle_to_mr_[handle];
         }
