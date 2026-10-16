@@ -144,8 +144,19 @@ void cudaExternal()
 int main(int argc, char** argv)
 {
     try {
-        Backend backend = argc > 1 && std::string(argv[1]) == "cuda" ? Backend::Cuda : Backend::Host;
-        bool    stress  = argc > 2 && std::string(argv[2]) == "stress";
+        Backend backend = Backend::Host;
+        if (argc > 1) {
+            std::string name = argv[1];
+            if (name == "cuda")
+                backend = Backend::Cuda;
+            else if (name == "maca")
+                backend = Backend::Maca;
+            else if (name == "ascend")
+                backend = Backend::Ascend;
+            else if (name != "host")
+                throw std::invalid_argument("unknown backend");
+        }
+        bool stress = argc > 2 && std::string(argv[2]) == "stress";
         if (stress) {
             auto                           rt = DeviceRuntime::create(backend);
             std::vector<std::future<void>> tasks;

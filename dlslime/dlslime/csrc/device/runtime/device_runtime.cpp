@@ -237,6 +237,42 @@ Event DeviceRuntime::copy(const BufferView& dst, const BufferView& src, const St
     e->dependencies.swap(stream.state_->dependencies);
     return Event(e);
 }
+DmaBuf DeviceRuntime::exportDmaBuf(const BufferView& view) const
+{
+    require(view.allocation_->driver == driver_, "DMA-BUF allocation belongs to a different runtime");
+    require(view.allocation_->info.kind == MemoryKind::Device && view.size() > 0,
+            "DMA-BUF requires a nonempty device range");
+    auto state        = std::make_shared<detail::DmaBufState>();
+    state->allocation = view.allocation_;
+    state->exported =
+        driver_->exportDmaBuf(view.allocation_->pointer, view.allocation_->info.bytes, view.offset_, view.size());
+    return DmaBuf(state);
+}
+int DmaBuf::fd() const
+{
+    require(bool(state_), "empty DMA-BUF");
+    return state_->exported.fd;
+}
+size_t DmaBuf::offset() const
+{
+    require(bool(state_), "empty DMA-BUF");
+    return state_->exported.offset;
+}
+size_t DmaBuf::size() const
+{
+    require(bool(state_), "empty DMA-BUF");
+    return state_->exported.bytes;
+}
+size_t DmaBuf::exportedSize() const
+{
+    require(bool(state_), "empty DMA-BUF");
+    return state_->exported.exported_bytes;
+}
+size_t DmaBuf::granularity() const
+{
+    require(bool(state_), "empty DMA-BUF");
+    return state_->exported.granularity;
+}
 namespace detail {
 int pciNumaNode(const std::string& pci)
 {

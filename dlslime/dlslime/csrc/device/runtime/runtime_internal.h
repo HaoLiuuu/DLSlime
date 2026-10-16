@@ -1,13 +1,26 @@
 #pragma once
+#include <unistd.h>
+
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 
 #include "device_runtime.h"
 
 namespace dlslime::device::detail {
 using NativeHandle = uintptr_t;
+struct DmaBufExport {
+    int    fd     = -1;
+    size_t offset = 0, bytes = 0, exported_bytes = 0, granularity = 0;
+};
 class Driver {
+public:
+    virtual DmaBufExport exportDmaBuf(void*, size_t, size_t, size_t)
+    {
+        throw std::runtime_error("DMA-BUF export unsupported");
+    }
+
 public:
     virtual ~Driver()                                                                           = default;
     virtual DeviceInfo   info() const                                                           = 0;
@@ -46,6 +59,15 @@ struct AllocationState {
     {
         if (pointer)
             cleanup([&] { driver->release(pointer, info.kind); });
+    }
+};
+struct DmaBufState {
+    std::shared_ptr<AllocationState> allocation;
+    DmaBufExport                     exported;
+    ~DmaBufState()
+    {
+        if (exported.fd >= 0)
+            ::close(exported.fd);
     }
 };
 struct EventState {
