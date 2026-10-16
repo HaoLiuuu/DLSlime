@@ -33,7 +33,6 @@ For a functional two-host READ/WRITE smoke test, start `tcp_regression --serve <
 
 Current cross-host acceptance is MetaX to/from Ascend on the existing 25 Gb/s management network. H200 runs local tests while its cross-host network is unavailable. This PR neither registers Ascend HBM with IBVerbs nor changes host networking, drivers, or vendor environments.
 
-
 ## Bounded HOST READ pipelining
 
 Multi-span HOST READ batches use a rolling window on one pooled connection. The client can send later request headers while an earlier response is arriving. It keeps one composed Asio write and one composed Asio read active at most, and receives complete responses in request order. This preserves overlapping destination-span ordering and the existing wire protocol. The server requires no protocol changes.

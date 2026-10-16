@@ -16,12 +16,12 @@ the registry retains the C++ allocation after its Python wrapper is collected.
 `RegionSpan` names local and remote regions and separate byte offsets/length.
 No remote virtual pointer is exposed or accepted on the wire.
 
-| Operation/result | Guarantee |
-| --- | --- |
-| WRITE success (0) | Every span has a matching successful destination ACK, emitted only after the target received the complete HOST payload. All local socket callbacks have also retired. |
-| READ success (0) | Every matching response and its complete payload has arrived in the local destination; all local callbacks retired. READ data flows from the remote source to the initiator. |
+| Operation/result                                                                     | Guarantee                                                                                                                                                                                  |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| WRITE success (0)                                                                    | Every span has a matching successful destination ACK, emitted only after the target received the complete HOST payload. All local socket callbacks have also retired.                      |
+| READ success (0)                                                                     | Every matching response and its complete payload has arrived in the local destination; all local callbacks retired. READ data flows from the remote source to the initiator.               |
 | Error (-1), deadline (-2), cancel/shutdown (-3), rejection (-4), protocol error (-5) | Local socket I/O has quiesced and local Region leases have been released. The remote outcome may be partial or unknown, including a successful write with a lost ACK. No automatic replay. |
-| Busy (-6) | Endpoint admission limit reached before network I/O or local leases were taken. |
+| Busy (-6)                                                                            | Endpoint admission limit reached before network I/O or local leases were taken.                                                                                                            |
 
 `wait_for` timing out only ends that wait; it does not cancel the operation.
 Call `cancel()` and wait for the terminal Future before treating local buffers as
@@ -64,19 +64,19 @@ device allocation, multi-PD ownership, or device consumer fences.
 All fields use explicit big-endian encoding. The header is exactly 72 bytes,
 independent of compiler padding and x86_64/aarch64 ABI.
 
-| Offset | Bytes | Field |
-| --- | --- | --- |
-| 0 | 4 | Magic `DLS2` |
-| 4 | 2 | Version, 2 |
-| 6 | 2 | Opcode: READ=1, WRITE=2; response sets bit 15 |
-| 8 | 4 | Status: success=0, stale=1, denied=2, bounds=3, closed=4, malformed=5 |
-| 12 | 4 | Reserved, must be zero |
-| 16 | 8 | Nonzero request ID, never reused by the endpoint |
-| 24 | 16 | Registry scope, high then low word |
-| 40 | 8 | Region slot ID |
-| 48 | 8 | Generation |
-| 56 | 8 | Region byte offset |
-| 64 | 8 | Payload length |
+| Offset | Bytes | Field                                                                 |
+| ------ | ----- | --------------------------------------------------------------------- |
+| 0      | 4     | Magic `DLS2`                                                          |
+| 4      | 2     | Version, 2                                                            |
+| 6      | 2     | Opcode: READ=1, WRITE=2; response sets bit 15                         |
+| 8      | 4     | Status: success=0, stale=1, denied=2, bounds=3, closed=4, malformed=5 |
+| 12     | 4     | Reserved, must be zero                                                |
+| 16     | 8     | Nonzero request ID, never reused by the endpoint                      |
+| 24     | 16    | Registry scope, high then low word                                    |
+| 40     | 8     | Region slot ID                                                        |
+| 48     | 8     | Generation                                                            |
+| 56     | 8     | Region byte offset                                                    |
+| 64     | 8     | Payload length                                                        |
 
 READ sends a request header and receives a response header followed by exactly
 `length` bytes. WRITE sends a header followed by `length` bytes and receives only
