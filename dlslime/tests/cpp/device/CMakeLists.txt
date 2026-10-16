@@ -1,0 +1,10 @@
+find_package(Threads REQUIRED)
+add_executable(device_runtime_test runtime_test.cpp)
+target_link_libraries(device_runtime_test PRIVATE _slime_device Threads::Threads)
+if(DLSLIME_RUNTIME_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_compile_definitions(device_runtime_test PRIVATE DLSLIME_RUNTIME_CUDA_TEST)
+    target_link_libraries(device_runtime_test PRIVATE CUDA::cuda_driver)
+endif()
+add_test(NAME device_runtime_host COMMAND device_runtime_test host)
+# Real accelerator tests are explicitly selected after checking business load.
