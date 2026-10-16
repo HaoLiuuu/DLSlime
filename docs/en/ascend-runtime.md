@@ -39,3 +39,23 @@ guard permits this only for a live, exact-range allocation owned by DeviceRuntim
 and classified as HostPinned at allocation. Unowned device mappings remain
 rejected, including caller-supplied HOST claims. A native test verifies that this
 owned pinned DRAM reaches the real verbs provider while HBM never does.
+
+## HOST copy memory and NIC qualification
+
+Pinned HOST capability means that ACL can use the allocation for asynchronous
+copies; it does not guarantee host-NIC MR support. On the validated 910B2 / CANN
+9.1 / Linux 5.10 / mlx5_0 deployment, ordinary POSIX DRAM registers successfully,
+but aclrtMallocHost memory is rejected by ibv_reg_mr with EFAULT. This is recorded
+as unsupported provider qualification, not a successful MR test. The runtime
+still provides the native pinned-copy allocator. Future RDMA staging must use
+separate NIC-registered POSIX DRAM and ACL pinned-copy pools, with a pipelined
+CPU copy between them, unless another allocator/provider combination is qualified.
+TCP can use the CPU-accessible ACL allocation directly.
+
+Provider registration errors propagate as system_error. A failed replacement
+registration preserves the previous MR; raw callers must still quiesce users
+before a successful MR growth changes its key. This does not add MR leases.
+
+The Linux 5.10 deployment is not used to try registering ordinary pageable memory
+through aclrtHostRegisterV2: its documented kernel restriction requires a separate
+qualification. No kernel, driver, or host-network settings are changed.

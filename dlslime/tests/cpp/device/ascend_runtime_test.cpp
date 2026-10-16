@@ -2,12 +2,14 @@
 #include <dlfcn.h>
 #include <sys/mman.h>
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <system_error>
 
 #include "dlslime/csrc/device/runtime/device_runtime.h"
 #include "dlslime/csrc/engine/rdma/rdma_endpoint.h"
@@ -37,10 +39,11 @@ int main(int argc, char** argv)
 {
     try {
         check(argc == 2, "usage: ascend_runtime_test qualified-rdma-device");
-        auto calls   = reinterpret_cast<uint64_t (*)()>(dlsym(RTLD_DEFAULT, "dlslime_probe_calls"));
-        auto blocked = reinterpret_cast<uint64_t (*)()>(dlsym(RTLD_DEFAULT, "dlslime_probe_blocked"));
-        auto forbid  = reinterpret_cast<void (*)(void*, size_t)>(dlsym(RTLD_DEFAULT, "dlslime_probe_forbid"));
-        check(calls && blocked && forbid, "verbs interception probe must be preloaded");
+        auto calls    = reinterpret_cast<uint64_t (*)()>(dlsym(RTLD_DEFAULT, "dlslime_probe_calls"));
+        auto blocked  = reinterpret_cast<uint64_t (*)()>(dlsym(RTLD_DEFAULT, "dlslime_probe_blocked"));
+        auto forbid   = reinterpret_cast<void (*)(void*, size_t)>(dlsym(RTLD_DEFAULT, "dlslime_probe_forbid"));
+        auto failNext = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "dlslime_probe_fail_next"));
+        check(calls && blocked && forbid && failNext, "verbs interception probe must be preloaded");
         ok(aclInit(nullptr));
         aclrtContext caller;
         ok(aclrtCreateContext(&caller, 0));
@@ -70,6 +73,23 @@ int main(int argc, char** argv)
             check(endpoint->registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 4096) == first
                       && calls() == before + 1,
                   "cached HOST registration changed");
+            auto retained = endpoint->get_local_pool()->get_mr_fast(first);
+            failNext(ENOMEM);
+            rejected(
+                [&] { endpoint->registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 8192); });
+            check(endpoint->get_local_pool()->get_mr_fast(first) == retained && retained->length == 4096,
+                  "failed MR growth invalidated the previous registration");
+            failNext(EOPNOTSUPP);
+            rejected([&] {
+                endpoint->registerOrAccessMemoryRegion(
+                    "new.failure", reinterpret_cast<uintptr_t>(host) + 32768, 0, 4096);
+            });
+            check(endpoint->registerOrAccessMemoryRegion(
+                      "new.success", reinterpret_cast<uintptr_t>(host) + 32768, 0, 4096)
+                      >= 0,
+                  "failed new registration poisoned the cache");
+            check(endpoint->registerOrAccessMemoryRegion("host", reinterpret_cast<uintptr_t>(host), 0, 8192) == first,
+                  "MR growth recovery failed");
             endpoint->shutdown();
         }
         std::free(host);
@@ -82,11 +102,24 @@ int main(int argc, char** argv)
         {
             auto endpoint = std::make_shared<dlslime::RDMAEndpoint>(argv[1], 1, "RoCE", 2);
             auto before   = calls();
-            check(endpoint->registerOrAccessMemoryRegion(
-                      "pinned.host", reinterpret_cast<uintptr_t>(pinned.data()), 0, pinned.size())
-                          >= 0
-                      && calls() == before + 1,
-                  "owned pinned HOST registration did not reach real verbs");
+            try {
+                check(endpoint->registerOrAccessMemoryRegion(
+                          "pinned.host", reinterpret_cast<uintptr_t>(pinned.data()), 0, pinned.size())
+                          >= 0,
+                      "owned pinned HOST registration returned invalid handle");
+                std::cout << "QUALIFICATION ACL pinned HOST verbs registration: supported\n";
+            }
+            catch (const std::system_error& e) {
+                // This kernel/provider cannot pin the CANN device-file mapping.
+                // It is still HOST memory usable for ACL copies. Report the
+                // independent NIC qualification, never pretend registration passed.
+                if (e.code().value() != EFAULT)
+                    throw;
+                std::cout
+                    << "QUALIFICATION ACL pinned HOST verbs registration: unavailable, EFAULT; use separate NIC DRAM and ACL pinned-copy pools\n";
+            }
+            check(calls() == before + 1 && blocked() == 0,
+                  "pinned HOST did not reach the guarded provider exactly once");
             endpoint->shutdown();
         }
         auto owned = rt.allocate(4096, MemoryKind::Device);
@@ -99,7 +132,7 @@ int main(int argc, char** argv)
         ok(aclrtFree(hbm));
         ok(aclrtDestroyContext(caller));
         std::cout
-            << "PASS Ascend cold-start HBM/UNKNOWN/overflow rejection before verbs, real HOST registration/cache, pinned DRAM, external pointer and caller context\n";
+            << "PASS Ascend cold-start HBM/UNKNOWN/overflow rejection before verbs, real pageable HOST registration/cache, provider failure recovery, separate pinned-HOST qualification, external pointer and caller context\n";
         return 0;
     }
     catch (const std::exception& e) {
