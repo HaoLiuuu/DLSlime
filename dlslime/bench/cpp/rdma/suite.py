@@ -184,7 +184,7 @@ def metadata(args):
             'binary_sha256': hashlib.sha256(Path(args.binary).read_bytes()).hexdigest(),
             'kernel': platform.release(), 'numa_policy': 'first touch; explicit two-CPU budget reapplied to every RDMA progress thread',
             'outstanding_batches_per_initiator': 1, 'rounds': args.rounds,
-            'read_window': args.read_window, 'read_window_bytes': args.read_window_bytes,
+            'read_window': None, 'read_window_bytes': None,
             'warmup_seconds': args.warmup, 'measure_seconds': args.seconds,
             'span_sizes': args.sizes, 'batch_sizes': args.batches,
             'loopback': args.remote is None, 'same_node_rdma': args.remote is None,
