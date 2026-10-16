@@ -96,7 +96,15 @@ int main(int argc, char** argv)
     std::vector<assign_tuple_t> bad_spans;
     for (size_t i = 0; i < 257; ++i)
         bad_spans.emplace_back(local, bad_handle, i * 64, i * 64, 64);
-    CHECK(a->write(bad_spans, nullptr)->wait() != 0);
+    auto failed_write = a->write(bad_spans, nullptr);
+    bool failed       = false;
+    try {
+        failed_write->wait();
+    }
+    catch (const std::runtime_error&) {
+        failed = true;
+    }
+    CHECK(failed);
     std::cout << "PASS remote access error retires every shard" << std::endl;
     auto pending = b->immRecv();
     a->shutdown();
