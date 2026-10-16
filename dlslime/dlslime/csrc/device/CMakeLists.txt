@@ -64,3 +64,12 @@ install(
     EXPORT dlslimeTargets
     LIBRARY DESTINATION ${DLSLIME_INSTALL_PATH}
 )
+
+option(DLSLIME_RUNTIME_CUDA "Build native CUDA Driver runtime" ${USE_CUDA})
+target_sources(_slime_device PRIVATE runtime/device_runtime.cpp runtime/host_runtime.cpp)
+if(DLSLIME_RUNTIME_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    target_sources(_slime_device PRIVATE runtime/cuda_runtime.cpp)
+    target_compile_definitions(_slime_device PRIVATE DLSLIME_RUNTIME_CUDA)
+    target_link_libraries(_slime_device PRIVATE CUDA::cuda_driver)
+endif()

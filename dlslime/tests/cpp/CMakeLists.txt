@@ -9,3 +9,5 @@ endif()
 if(BUILD_RDMA)
     add_subdirectory(rdma)
 endif()
+
+add_subdirectory(device)

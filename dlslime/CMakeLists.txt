@@ -115,3 +115,8 @@ if(BUILD_RDMA_BENCH)
     endif()
     add_subdirectory(bench/cpp/rdma)
 endif()
+
+option(BUILD_DEVICE_BENCH "Build device copy benchmark" OFF)
+if(BUILD_DEVICE_BENCH)
+    add_subdirectory(bench/cpp/device)
+endif()

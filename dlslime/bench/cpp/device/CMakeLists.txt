@@ -1,0 +1,2 @@
+add_executable(device_copy_bench device_copy_bench.cpp)
+target_link_libraries(device_copy_bench PRIVATE _slime_device)
