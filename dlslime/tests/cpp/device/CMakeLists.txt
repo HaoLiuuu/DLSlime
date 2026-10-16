@@ -22,3 +22,15 @@ if(DLSLIME_RUNTIME_ASCEND AND BUILD_RDMA)
     target_include_directories(ascend_runtime_test PRIVATE ${DLSLIME_ASCEND_INCLUDE})
     target_link_libraries(ascend_runtime_test PRIVATE _slime_device _slime_rdma ${DLSLIME_ASCEND_LIBRARY} dl)
 endif()
+
+# Compile the common implementation separately so fault injection cannot become
+# a production backend, link to a vendor SDK, or affect the native device DSO.
+add_executable(device_runtime_fault_test
+    runtime_fault_test.cpp
+    ../../../dlslime/csrc/device/runtime/device_runtime.cpp
+    ../../../dlslime/csrc/device/runtime/host_runtime.cpp)
+target_include_directories(device_runtime_fault_test PRIVATE ${PROJECT_SOURCE_DIR})
+target_compile_definitions(device_runtime_fault_test PRIVATE DLSLIME_RUNTIME_TEST_ACCESS)
+target_link_libraries(device_runtime_fault_test PRIVATE Threads::Threads)
+add_test(NAME device_runtime_faults COMMAND device_runtime_fault_test)
+set_tests_properties(device_runtime_faults PROPERTIES TIMEOUT 30)

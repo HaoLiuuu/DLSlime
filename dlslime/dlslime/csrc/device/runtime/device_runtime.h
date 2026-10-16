@@ -51,6 +51,9 @@ struct AllocationState;
 struct StreamState;
 struct EventState;
 class Driver;
+#ifdef DLSLIME_RUNTIME_TEST_ACCESS
+struct RuntimeTestAccess;
+#endif
 }  // namespace detail
 class BufferView;
 class Allocation {
@@ -147,6 +150,9 @@ public:
     Event copy(const BufferView& destination, const BufferView& source, const Stream& stream) const;
 
 private:
+#ifdef DLSLIME_RUNTIME_TEST_ACCESS
+    friend struct detail::RuntimeTestAccess;
+#endif
     explicit DeviceRuntime(std::shared_ptr<detail::Driver> driver): driver_(std::move(driver)) {}
     std::shared_ptr<detail::Driver> driver_;
 };
