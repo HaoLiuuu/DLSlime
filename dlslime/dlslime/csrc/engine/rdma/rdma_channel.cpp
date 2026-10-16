@@ -1,5 +1,10 @@
 #include "rdma_channel.h"
 
+#include <arpa/inet.h>
+
+#include <limits>
+#include <stdexcept>
+
 #include "dlslime/csrc/observability/obs.h"
 #include "memory_pool.h"
 
@@ -50,8 +55,7 @@ int32_t RDMAChannel::init(std::shared_ptr<RDMAContext> ctx, size_t num_qp, int32
 
         qp_[qpi] = ibv_create_qp(local_pool_->pd_, &qp_init_attr);
         if (!qp_[qpi]) {
-            SLIME_LOG_ERROR(
-                "[" << ctx_->device_name_ << "] Failed to create QP " << qp_[qpi]->qp_num, ": ", strerror(errno));
+            SLIME_LOG_ERROR("[" << ctx_->device_name_ << "] Failed to create QP ", qpi, ": ", strerror(errno));
             return -1;
         }
 
@@ -74,7 +78,7 @@ int32_t RDMAChannel::init(std::shared_ptr<RDMAContext> ctx, size_t num_qp, int32
         int32_t psn = lrand48() & 0xffffff;
 
         /* Get GID */
-        if (ctx_->gidx_ != -1 && ibv_query_gid(ctx_->ib_ctx_, 1, ctx_->gidx_, &ctx_->gid_)) {
+        if (ctx_->gidx_ != -1 && ibv_query_gid(ctx_->ib_ctx_, ctx_->ib_port_, ctx_->gidx_, &ctx_->gid_)) {
             SLIME_LOG_ERROR("[" << ctx_->device_name_ << "] Failed to get GID");
         }
 
@@ -144,7 +148,7 @@ int32_t RDMAChannel::modify_qp_to_r2r()
         attr.dest_qp_num           = remote_rdma_info_[qpi].qpn;
         attr.rq_psn                = remote_rdma_info_[qpi].psn;
         attr.max_dest_rd_atomic    = SLIME_MAX_DEST_RD_ATOMIC;
-        attr.min_rnr_timer         = 0x20;
+        attr.min_rnr_timer         = 0x12;
         attr.ah_attr.dlid          = remote_rdma_info_[qpi].lid;
         attr.ah_attr.sl            = SLIME_SERVICE_LEVEL;
         attr.ah_attr.src_path_bits = 0;
@@ -155,7 +159,7 @@ int32_t RDMAChannel::modify_qp_to_r2r()
 
         if (local_rdma_info_[qpi].gidx == -1) {
             // IB
-            attr.ah_attr.dlid = local_rdma_info_[qpi].lid;
+            attr.ah_attr.dlid = remote_rdma_info_[qpi].lid;
         }
         else {
             // RoCE v2
@@ -205,166 +209,139 @@ int32_t RDMAChannel::modify_qp_to_r2s()
     return 0;
 }
 
+int32_t RDMAChannel::destroy_qp(size_t qpi)
+{
+    if (!qp_[qpi])
+        return 0;
+    auto*     qp     = qp_[qpi];
+    const int result = ibv_destroy_qp(qp);
+    if (!result)
+        qp_[qpi] = nullptr;
+    return result;
+}
 int32_t RDMAChannel::reset()
 {
-    for (auto& qp : qp_) {
-        if (qp)
-            ibv_destroy_qp(qp);
+    int status = 0;
+    for (size_t i = 0; i < qp_.size(); ++i) {
+        if (!qp_[i])
+            continue;
+        const auto number = qp_[i]->qp_num;
+        if (!ctx_->completions_.quiesce(number, [&] { return destroy_qp(i); }))
+            status = -1;
     }
-    return 0;
+    state = RDMAChannelState::Destroyed;
+    return status;
 }
-
-int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool)
+int64_t RDMAChannel::post_send_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> pool)
 {
-    int                 ret        = 0;
-    size_t              batch_size = assign->batch_size();
-    struct ibv_send_wr* bad_wr     = nullptr;
-    struct ibv_send_wr* wr         = send_wr_pool_[qpi].data();
-    struct ibv_sge*     sge        = send_sge_pool_[qpi].data();
-    for (size_t i = 0; i < batch_size; ++i) {
-
-        Assignment&    subassign = assign->batch_[i];
-        struct ibv_mr* mr;
-        if (subassign.mr_key < 1000000) {
-            mr = local_pool->get_mr_fast((int32_t)subassign.mr_key);
+    return post_batch(qpi, assign, std::move(pool), false, false);
+}
+int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> pool)
+{
+    return post_batch(qpi, assign, std::move(pool), true, false);
+}
+int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> pool)
+{
+    return post_batch(qpi, assign, std::move(pool), false, true);
+}
+int64_t RDMAChannel::post_batch(
+    int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> pool, bool receiving, bool one_sided)
+{
+    // Snapshot the callback before posting. A CQE may recycle the assignment
+    // slot before this function returns; no code below accesses it afterward.
+    auto          callback    = std::move(assign->callback_);
+    const auto    opcode      = assign->opcode_;
+    const bool    inline_data = assign->is_inline_;
+    const int32_t immediate   = assign->imm_data_;
+    const auto    batch       = assign->batch_;
+    const size_t  count       = batch.size();
+    const auto    obs_opcode  = receiving ? obs::OBS_OP_RECV : obs::OPCODE_TO_OBS[static_cast<uint8_t>(opcode)];
+    try {
+        if (qpi < 0 || size_t(qpi) >= qp_.size() || !qp_[qpi] || !count
+            || count > size_t(receiving ? SLIME_MAX_RECV_WR : SLIME_MAX_SEND_WR))
+            throw std::invalid_argument("Invalid RDMA QP or batch size");
+        std::vector<ibv_sge>     sge(count);
+        std::vector<ibv_send_wr> sends(receiving ? 0 : count);
+        std::vector<ibv_recv_wr> receives(receiving ? count : 0);
+        uint64_t                 total_bytes = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const auto& a = batch[i];
+            auto* mr = a.mr_key < 1000000 ? pool->get_mr_fast(static_cast<int32_t>(a.mr_key)) : pool->get_mr(a.mr_key);
+            if (!mr || a.source_offset > mr->length || a.length > mr->length - a.source_offset || a.length > UINT32_MAX
+                || a.source_offset > UINTPTR_MAX - reinterpret_cast<uintptr_t>(mr->addr))
+                throw std::invalid_argument("Invalid local RDMA range");
+            sge[i].addr   = reinterpret_cast<uintptr_t>(mr->addr) + a.source_offset;
+            sge[i].length = static_cast<uint32_t>(a.length);
+            sge[i].lkey   = mr->lkey;
+            total_bytes += a.length;
+            if (receiving) {
+                receives[i].sg_list = &sge[i];
+                receives[i].num_sge = 1;
+                receives[i].next    = i + 1 < count ? &receives[i + 1] : nullptr;
+            }
+            else {
+                auto& wr  = sends[i];
+                wr.opcode = ASSIGN_OP_2_IBV_WR_OP.at(opcode);
+                if (i + 1 < count) {
+                    if (wr.opcode == IBV_WR_RDMA_WRITE_WITH_IMM)
+                        wr.opcode = IBV_WR_RDMA_WRITE;
+                    if (wr.opcode == IBV_WR_SEND_WITH_IMM)
+                        wr.opcode = IBV_WR_SEND;
+                }
+                wr.sg_list    = &sge[i];
+                wr.num_sge    = 1;
+                wr.send_flags = IBV_SEND_SIGNALED;
+                if (inline_data && wr.opcode != IBV_WR_RDMA_READ)
+                    wr.send_flags |= IBV_SEND_INLINE;
+                wr.imm_data = htonl(static_cast<uint32_t>(immediate));
+                wr.next     = i + 1 < count ? &sends[i + 1] : nullptr;
+                if (one_sided) {
+                    auto remote = remote_pool_->get_remote_mr_fast(static_cast<int32_t>(a.remote_mr_key));
+                    if (!remote.addr || a.target_offset > remote.length || a.length > remote.length - a.target_offset
+                        || a.target_offset > UINTPTR_MAX - remote.addr)
+                        throw std::invalid_argument("Invalid remote RDMA range");
+                    wr.wr.rdma.remote_addr = remote.addr + a.target_offset;
+                    wr.wr.rdma.rkey        = remote.rkey;
+                }
+            }
+        }
+        auto*      qp     = qp_[qpi];
+        const auto number = qp->qp_num;
+        int        result;
+        if (receiving) {
+            result = ctx_->completions_.post(
+                number,
+                receives.data(),
+                count,
+                callback,
+                pool,
+                [qp](ibv_recv_wr* wr, ibv_recv_wr** bad) { return ibv_post_recv(qp, wr, bad); },
+                [&] { return destroy_qp(qpi); });
         }
         else {
-            mr = local_pool->get_mr(subassign.mr_key);
+            result = ctx_->completions_.post(
+                number,
+                sends.data(),
+                count,
+                callback,
+                pool,
+                [qp](ibv_send_wr* wr, ibv_send_wr** bad) { return ibv_post_send(qp, wr, bad); },
+                [&] { return destroy_qp(qpi); });
         }
-        sge[i].addr      = (uintptr_t)mr->addr + subassign.source_offset;
-        sge[i].length    = subassign.length;
-        sge[i].lkey      = mr->lkey;
-        wr[i].wr_id      = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
-        wr[i].opcode     = ASSIGN_OP_2_IBV_WR_OP.at(assign->opcode_);
-        wr[i].sg_list    = &sge[i];
-        wr[i].num_sge    = 1;
-        wr[i].imm_data   = (i == batch_size - 1) ? assign->imm_data_ : UNDEFINED_IMM_DATA;
-        wr[i].send_flags = (i == batch_size - 1) ? IBV_SEND_SIGNALED : 0;
-        if (assign->is_inline_)
-            wr[i].send_flags |= IBV_SEND_INLINE;
-        wr[i].next = (i == batch_size - 1) ? nullptr : &wr[i + 1];
+        if (result) {
+            obs::obs_record_post_failure(obs_nic_id_, obs_opcode);
+            return -1;
+        }
+        if (obs::obs_enabled())
+            obs::obs_record_post_batch(obs_nic_id_, obs_opcode, static_cast<uint32_t>(count), total_bytes);
+        return 0;
     }
-    ret = ibv_post_send(qp_[qpi], wr, &bad_wr);
-    if (ret) {
-        obs::obs_record_post_failure(obs_nic_id_, obs::OPCODE_TO_OBS[static_cast<uint8_t>(assign->opcode_)]);
+    catch (const std::exception& error) {
+        SLIME_LOG_ERROR("RDMA batch validation/allocation failed: ", error.what());
+        obs::obs_record_post_failure(obs_nic_id_, obs_opcode);
+        if (callback)
+            callback(RDMAAssign::FAILED, 0);
         return -1;
     }
-
-    // Observability: record transport-level post (bytes already computed in sge loop)
-    if (obs::obs_enabled()) {
-        uint64_t total_bytes = 0;
-        for (size_t i = 0; i < batch_size; ++i)
-            total_bytes += sge[i].length;
-        obs::obs_record_post_batch(obs_nic_id_,
-                                   obs::OPCODE_TO_OBS[static_cast<uint8_t>(assign->opcode_)],
-                                   static_cast<uint32_t>(batch_size),
-                                   total_bytes);
-    }
-
-    return 0;
 }
-
-int64_t RDMAChannel::post_recv_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool)
-{
-    int64_t             ret        = 0;
-    size_t              batch_size = assign->batch_size();
-    struct ibv_recv_wr* bad_wr     = nullptr;
-    struct ibv_recv_wr* wr         = recv_wr_pool_[qpi].data();
-    struct ibv_sge*     sge        = recv_sge_pool_[qpi].data();
-    for (size_t i = 0; i < batch_size; ++i) {
-
-        Assignment&    subassign = assign->batch_[i];
-        struct ibv_mr* mr;
-        if (subassign.mr_key < 1000000) {
-            mr = local_pool->get_mr_fast((int32_t)subassign.mr_key);
-        }
-        else {
-            mr = local_pool->get_mr(subassign.mr_key);
-        }
-        sge[i].addr   = (uintptr_t)mr->addr + subassign.source_offset;
-        sge[i].length = subassign.length;
-        sge[i].lkey   = mr->lkey;
-        wr[i].wr_id   = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
-        wr[i].sg_list = &sge[i];
-        wr[i].num_sge = 1;
-        wr[i].next    = (i == batch_size - 1) ? nullptr : &wr[i + 1];
-    }
-    ret = ibv_post_recv(qp_[qpi], wr, &bad_wr);
-    if (ret) {
-        SLIME_LOG_ERROR("Failed to post RDMA recv : " << strerror(ret));
-        obs::obs_record_post_failure(obs_nic_id_, obs::OBS_OP_RECV);
-        return -1;
-    }
-
-    // Observability: record transport-level post
-    if (obs::obs_enabled()) {
-        uint64_t total_bytes = 0;
-        for (size_t i = 0; i < batch_size; ++i)
-            total_bytes += sge[i].length;
-        obs::obs_record_post_batch(obs_nic_id_, obs::OBS_OP_RECV, static_cast<uint32_t>(batch_size), total_bytes);
-    }
-
-    return 0;
-}
-
-int64_t RDMAChannel::post_rc_oneside_batch(int qpi, RDMAAssign* assign, std::shared_ptr<RDMAMemoryPool> local_pool)
-{
-    size_t                          batch_size = assign->batch_size();
-    struct ibv_send_wr*             bad_wr     = NULL;
-    std::vector<struct ibv_send_wr> wr(batch_size);
-    std::vector<struct ibv_sge>     sge(batch_size);
-
-    for (size_t i = 0; i < batch_size; ++i) {
-        Assignment&    subassign = assign->batch_[i];
-        struct ibv_mr* mr        = local_pool->get_mr_fast((int32_t)subassign.mr_key);
-        remote_mr_t    remote_mr = remote_pool_->get_remote_mr_fast((int32_t)subassign.remote_mr_key);
-
-        // RDMA: target=远端, source=本地. SGE=local(source), wr.rdma=remote(target)
-        sge[i].addr   = (uintptr_t)mr->addr + subassign.source_offset;
-        sge[i].length = subassign.length;
-        sge[i].lkey   = mr->lkey;
-
-        wr[i].wr_id  = (i == batch_size - 1) ? (uintptr_t)(assign) : 0;
-        wr[i].opcode = ASSIGN_OP_2_IBV_WR_OP.at(assign->opcode_);
-        if (wr[i].opcode == IBV_WR_RDMA_WRITE_WITH_IMM && (i != batch_size - 1)) {
-            wr[i].opcode = IBV_WR_RDMA_WRITE;
-        }
-
-        wr[i].sg_list    = &sge[i];
-        wr[i].num_sge    = 1;
-        wr[i].imm_data   = (i == batch_size - 1) ? assign->imm_data_ : UNDEFINED_IMM_DATA;
-        wr[i].send_flags = (i % 32 == 0 || i == batch_size - 1) ? IBV_SEND_SIGNALED : 0;
-        if (assign->is_inline_)
-            wr[i].send_flags |= IBV_SEND_INLINE;
-
-        wr[i].wr.rdma.remote_addr = remote_mr.addr + subassign.target_offset;
-        wr[i].wr.rdma.rkey        = remote_mr.rkey;
-
-        wr[i].next = (i == batch_size - 1) ? NULL : &wr[i + 1];
-    }
-    int ret = 0;
-    {
-        ret = ibv_post_send(qp_[qpi], &wr[0], &bad_wr);
-    }
-
-    if (ret) {
-        SLIME_LOG_ERROR("Failed to post RDMA send : " << strerror(ret), ". Error Assignment: ", assign->dump(), ".");
-        obs::obs_record_post_failure(obs_nic_id_, obs::OPCODE_TO_OBS[static_cast<uint8_t>(assign->opcode_)]);
-        return -1;
-    }
-
-    // Observability: record transport-level post
-    if (obs::obs_enabled()) {
-        uint64_t total_bytes = 0;
-        for (size_t i = 0; i < batch_size; ++i)
-            total_bytes += sge[i].length;
-        obs::obs_record_post_batch(obs_nic_id_,
-                                   obs::OPCODE_TO_OBS[static_cast<uint8_t>(assign->opcode_)],
-                                   static_cast<uint32_t>(batch_size),
-                                   total_bytes);
-    }
-
-    return 0;
-}
-
 }  // namespace dlslime

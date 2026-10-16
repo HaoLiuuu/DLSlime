@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -60,7 +62,8 @@ constexpr int BURST_SIZE    = 128;
 //   - user-visible completion signal, status, imm_data
 //   - op identity / lifetime
 struct ReadWriteContext {
-    int32_t slot_id;
+    std::array<bool, 32> token_charged{};
+    int32_t              slot_id;
 
     std::vector<RDMAAssign> assigns_;
 
@@ -263,6 +266,20 @@ private:
     // Private Methods - Initialization
     // ============================================================
     void init(std::shared_ptr<RDMAWorker> worker);
+    struct SubmissionGuard {
+        explicit SubmissionGuard(RDMAEndpoint&);
+        ~SubmissionGuard();
+        SubmissionGuard(const SubmissionGuard&) = delete;
+        RDMAEndpoint& endpoint;
+    };
+    void                    validateOneSided(const std::vector<assign_tuple_t>&);
+    void                    shutdownImpl(bool remove_worker);
+    void                    completeCancelledOps();
+    std::mutex              api_mutex_, progress_mutex_, shutdown_mutex_;
+    std::condition_variable submissions_done_;
+    size_t                  active_submissions_{};
+    std::atomic<bool>       closing_{false};
+    bool                    shutdown_complete_{};
 
     // ============================================================
     // Private Methods - IO Operations

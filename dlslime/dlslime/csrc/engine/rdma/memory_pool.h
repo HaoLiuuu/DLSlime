@@ -81,6 +81,7 @@ public:
     // Fast path: get MR by handle
     inline struct ibv_mr* get_mr_fast(int32_t handle)
     {
+        std::lock_guard<std::mutex> lock(name_mutex_);
         if (handle >= 0 && handle < handle_to_mr_.size()) {
             return handle_to_mr_[handle];
         }

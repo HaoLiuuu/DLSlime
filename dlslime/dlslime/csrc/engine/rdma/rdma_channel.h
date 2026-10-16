@@ -56,6 +56,8 @@ public:
     }
 
 private:
+    int64_t post_batch(int qpi, RDMAAssign*, std::shared_ptr<RDMAMemoryPool>, bool receiving, bool one_sided);
+    int32_t destroy_qp(size_t qpi);
     int32_t modify_qp_to_r2r();
     int32_t modify_qp_to_r2s();
 
