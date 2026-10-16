@@ -372,6 +372,17 @@ void rejected_requests()
         }
     }
 }
+void expired_before_start()
+{
+    TcpRegionEndpoint a("127.0.0.1"), b("127.0.0.1");
+    auto              source = std::make_shared<HostBuffer>(64), target = std::make_shared<HostBuffer>(64);
+    std::memset(source->data(), 42, 64);
+    auto ad = a.regions()->register_buffer(source), bd = b.regions()->register_buffer(target);
+    CHECK(wait(a.write(b.endpoint_info(), {{ad.key, bd, 0, 0, 64}}, 0)) == REGION_TIMEOUT);
+    CHECK(a.regions()->active_leases(ad.key) == 0);
+    for (size_t i = 0; i < 64; ++i)
+        CHECK(static_cast<char*>(target->data())[i] == 0);
+}
 void all_batch_validation()
 {
     TcpRegionEndpoint a("127.0.0.1"), b("127.0.0.1");
@@ -420,6 +431,7 @@ int main()
     } while (0)
     RUN(bounded_admission_and_write_cancel());
     RUN(overlapping_read_destinations());
+    RUN(expired_before_start());
     RUN(encoding());
     RUN(roundtrip());
     for (int mode = 0; mode < 5; ++mode)

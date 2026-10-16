@@ -116,6 +116,10 @@ public:
     }
     void start(const asio::ip::tcp::endpoint& peer, Clock::time_point until)
     {
+        if (Clock::now() >= until) {
+            cancel(REGION_TIMEOUT);
+            return;
+        }
         arm(until);
         if (socket_.is_open()) {
             pump();
