@@ -107,3 +107,11 @@ install(
         "${CMAKE_CURRENT_BINARY_DIR}/dlslimeConfigVersion.cmake"
     DESTINATION ${DLSLIME_CONFIG_DEST}
 )
+
+option(BUILD_RDMA_BENCH "Build the production RDMA DRAM benchmark" OFF)
+if(BUILD_RDMA_BENCH)
+    if(NOT BUILD_RDMA)
+        message(FATAL_ERROR "BUILD_RDMA_BENCH requires BUILD_RDMA")
+    endif()
+    add_subdirectory(bench/cpp/rdma)
+endif()
