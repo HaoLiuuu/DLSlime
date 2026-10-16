@@ -34,7 +34,9 @@ extern "C" ibv_mr* ibv_reg_mr(ibv_pd* pd, void* p, size_t n, int access)
         return nullptr;
     }
     using Register     = ibv_mr* (*)(ibv_pd*, void*, size_t, int);
-    static auto native = reinterpret_cast<Register>(dlsym(RTLD_NEXT, "ibv_reg_mr"));
+    // Forward the ABI used by DLSlime. Unversioned dlsym can resolve the
+    // legacy IBVERBS_1.0 compatibility function, which expects a different PD.
+    static auto native = reinterpret_cast<Register>(dlvsym(RTLD_NEXT, "ibv_reg_mr", "IBVERBS_1.1"));
     if (!native) {
         errno = ENOSYS;
         return nullptr;
