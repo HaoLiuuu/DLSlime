@@ -150,6 +150,10 @@ private:
     explicit DeviceRuntime(std::shared_ptr<detail::Driver> driver): driver_(std::move(driver)) {}
     std::shared_ptr<detail::Driver> driver_;
 };
+// Always validates pointer arithmetic. In ASCEND builds it additionally proves
+// the whole range is CPU-mapped HOST memory; no device hint can bypass this.
+// It does not acquire an allocation/MR lease: callers still own raw lifetimes.
+void        validateVerbsRegistration(const void* pointer, size_t bytes);
 const char* backendName(Backend);
 const char* memoryKindName(MemoryKind);
 }  // namespace dlslime::device

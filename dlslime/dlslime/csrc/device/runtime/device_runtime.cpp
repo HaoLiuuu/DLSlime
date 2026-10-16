@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 #include "runtime_internal.h"
@@ -272,6 +274,68 @@ size_t DmaBuf::granularity() const
 {
     require(bool(state_), "empty DMA-BUF");
     return state_->exported.granularity;
+}
+void validateVerbsRegistration(const void* pointer, size_t bytes)
+{
+    auto address = reinterpret_cast<uintptr_t>(pointer);
+    require(address && bytes && bytes <= std::numeric_limits<uintptr_t>::max() - address,
+            "invalid verbs registration range");
+#ifdef DLSLIME_RUNTIME_ASCEND
+    // Owned allocations allow exact range checks without consulting an optional
+    // staging endpoint. Any accelerator allocation is forbidden in this build.
+    bool ownedHost = false;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        auto                        it = registry.upper_bound(address);
+        if (it != registry.begin()) {
+            --it;
+            if (auto a = it->second.lock()) {
+                if (address - a->info.base < a->info.bytes) {
+                    require(hostMemory(a->info.kind),
+                            "Ascend transport requires DRAM staging; HBM verbs registration is forbidden");
+                    require(bytes <= a->info.bytes - (address - a->info.base),
+                            "verbs range exceeds its owned allocation");
+                    ownedHost = true;
+                }
+            }
+        }
+    }
+    // Check CPU mappings first. An unmapped device address, driver mapping, hole
+    // or inaccessible page is never sent to the SDK or ibv_reg_mr. Recheck every
+    // VMA segment and both endpoints; no caller-supplied memory-kind override.
+    std::ifstream maps("/proc/self/maps");
+    require(bool(maps), "cannot validate HOST mappings");
+    uintptr_t cursor = address, end = address + bytes;
+    for (std::string line; cursor < end && std::getline(maps, line);) {
+        std::istringstream row(line);
+        std::string        range, permissions, offset, device, inode, path;
+        row >> range >> permissions >> offset >> device >> inode;
+        std::getline(row, path);
+        auto dash = range.find('-');
+        if (dash == std::string::npos)
+            continue;
+        uintptr_t lo = std::stoull(range.substr(0, dash), nullptr, 16),
+                  hi = std::stoull(range.substr(dash + 1), nullptr, 16);
+        if (hi <= cursor)
+            continue;
+        require(lo <= cursor && permissions.size() >= 2 && permissions[0] == 'r' && permissions[1] == 'w',
+                "verbs range is not fully CPU-readable/writable HOST memory");
+        require(path.find("/dev/") == std::string::npos, "device-backed CPU mapping is not accepted as HOST DRAM");
+        uintptr_t stop = std::min(end, hi);
+        if (!ownedHost)
+            for (uintptr_t p : {cursor, stop - 1}) {
+                auto info = detail::queryAscendForRegistration(reinterpret_cast<void*>(p));
+                require(
+                    hostMemory(info.kind),
+                    "Ascend verbs registration requires proven HOST memory; DEVICE, MANAGED and UNKNOWN are rejected");
+                if (info.range_known)
+                    require(p >= info.base && p - info.base < info.bytes && stop - p <= info.bytes - (p - info.base),
+                            "verbs range exceeds SDK allocation");
+            }
+        cursor = stop;
+    }
+    require(cursor == end, "verbs range crosses unmapped memory");
+#endif
 }
 namespace detail {
 int pciNumaNode(const std::string& pci)

@@ -10,6 +10,7 @@
 #include <optional>
 #include <unordered_map>
 
+#include "dlslime/csrc/device/runtime/device_runtime.h"
 #include "dlslime/csrc/logging.h"
 #include "dlslime/csrc/observability/obs.h"
 
@@ -17,6 +18,7 @@ namespace dlslime {
 
 int32_t RDMAMemoryPool::registerMemoryRegion(uintptr_t data_ptr, uint64_t length, std::optional<std::string> name)
 {
+    device::validateVerbsRegistration(reinterpret_cast<const void*>(data_ptr), length);
     std::unique_lock<std::mutex> lock(name_mutex_);
 
     // Observability: classify this MR as a system (internal) or

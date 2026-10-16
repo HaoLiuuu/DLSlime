@@ -106,5 +106,6 @@ std::shared_ptr<Driver> makeHost();
 std::shared_ptr<Driver> makeCuda(int);
 std::shared_ptr<Driver> makeMaca(int);
 std::shared_ptr<Driver> makeAscend(int);
+PointerInfo             queryAscendForRegistration(const void* pointer);
 int                     pciNumaNode(const std::string& pci);
 }  // namespace dlslime::device::detail
