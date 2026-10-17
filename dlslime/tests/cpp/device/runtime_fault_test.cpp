@@ -79,7 +79,7 @@ void normalAndFailureTests()
     d->failNext(Fault::CreateStream);
     injected([&] { rt.createStream(); });
     empty(d);
-    for (auto point : {Fault::CreateEvent, Fault::CopyBefore, Fault::CopyAfter, Fault::Record}) {
+    for (auto point : {Fault::CreateEvent, Fault::CopyBefore, Fault::CopyAfter, Fault::Record, Fault::RecordAfter}) {
         {
             auto source = rt.allocate(4096, MemoryKind::HostPinned), target = rt.allocate(4096, MemoryKind::Device);
             std::memset(source.data(), 0x2c, 4096);
@@ -89,7 +89,7 @@ void normalAndFailureTests()
             injected([&] { rt.copy(target.view(0, 4096), source.view(0, 4096), stream); });
             check(d->pendingCount() == 0 && d->eventCount() == 0,
                   "failed submission did not drain and retire the native event");
-            const bool posted = point == Fault::CopyAfter || point == Fault::Record;
+            const bool posted = point == Fault::CopyAfter || point == Fault::Record || point == Fault::RecordAfter;
             check(d->completedCopies() == completed + size_t(posted), "unexpected partial-submission retirement");
             if (posted)
                 check(d->lastChecksum() == uint64_t(4096) * 0x2c,
@@ -99,9 +99,9 @@ void normalAndFailureTests()
         }
         empty(d);
     }
-    {
+    for (auto point : {Fault::Record, Fault::RecordAfter}) {
         auto stream = rt.createStream();
-        d->failNext(Fault::Record);
+        d->failNext(point);
         injected([&] { rt.record(stream); });
         check(d->eventCount() == 0, "failed record leaked event");
         auto event = rt.record(stream);
@@ -109,6 +109,31 @@ void normalAndFailureTests()
         check(event.ready(), "stream destruction did not drain marker");
     }
     empty(d);
+    for (auto point : {Fault::StreamWaitBefore, Fault::StreamWaitAfter}) {
+        {
+            auto source = rt.allocate(4096, MemoryKind::HostPinned);
+            auto target = rt.allocate(4096, MemoryKind::Device);
+            std::memset(source.data(), 0x39, 4096);
+            auto producer = rt.createStream(), consumer = rt.createStream();
+            auto event = rt.copy(target.view(0, 4096), source.view(0, 4096), producer);
+            source     = {};
+            target     = {};
+            d->failNext(point);
+            injected([&] { consumer.wait(event); });
+            if (point == Fault::StreamWaitAfter)
+                check(event.ready(), "accepted consumer wait was not drained on error");
+            event = {};
+            check(d->eventCount() == 0 && d->pendingCount() == 0 && d->allocationCount() == 0,
+                  "failed consumer wait released an in-use event or leaked owners");
+            check(d->lastChecksum() == uint64_t(4096) * 0x39, "producer data lost during failed wait cleanup");
+            auto retry = rt.record(producer);
+            consumer.wait(retry);
+            retry = {};
+            consumer.synchronize();
+        }
+        empty(d);
+    }
+    std::cout << "PASS CPU fake record/wait errors before and after submission, event retirement and stream reuse\n";
     std::cout
         << "PASS CPU fake delayed completion, producer dependencies, dropped owners, partial copy failure, event-record failure, recovery, and stream drain\n";
 }
@@ -146,6 +171,41 @@ void        failClosed(bool streamFailure)
     std::cout << "PASS CPU fake fail-closed " << (streamFailure ? "stream synchronize" : "event wait")
               << " preserves pending allocations\n";
 }
+void failClosedSubmission(bool recordFailure)
+{
+    auto pid = fork();
+    check(pid >= 0, "fork failed");
+    if (pid == 0) {
+        rlimit limit{0, 0};
+        setrlimit(RLIMIT_CORE, &limit);
+        std::set_terminate([] {
+            std::_Exit(fatalDriver && fatalDriver->synchronizeAttempts() == 1 && fatalDriver->allocationCount() == 2
+                               && fatalDriver->pendingCount() == 1 ?
+                           86 :
+                           87);
+        });
+        auto d      = std::make_shared<FakeDriver>();
+        fatalDriver = d.get();
+        auto rt     = detail::RuntimeTestAccess::create(d);
+        auto source = rt.allocate(128, MemoryKind::HostPinned), target = rt.allocate(128, MemoryKind::Device);
+        auto producer = rt.createStream(), consumer = rt.createStream();
+        auto event = rt.copy(target.view(0, 128), source.view(0, 128), producer);
+        source     = {};
+        target     = {};
+        d->failSequence({recordFailure ? Fault::RecordAfter : Fault::StreamWaitAfter, Fault::Synchronize});
+        if (recordFailure)
+            rt.record(producer);
+        else
+            consumer.wait(event);
+        std::_Exit(88);
+    }
+    int status = 0;
+    check(waitpid(pid, &status, 0) == pid, "waitpid failed");
+    check(WIFEXITED(status) && WEXITSTATUS(status) == 86,
+          "failed submission drain must terminate before releasing pending resources");
+    std::cout << "PASS CPU fake fail-closed " << (recordFailure ? "record" : "consumer wait")
+              << " submission preserves pending allocations\n";
+}
 void stress()
 {
     auto                           d  = std::make_shared<FakeDriver>();
@@ -172,6 +232,8 @@ int main(int argc, char** argv)
             normalAndFailureTests();
             failClosed(false);
             failClosed(true);
+            failClosedSubmission(false);
+            failClosedSubmission(true);
         }
         return 0;
     }

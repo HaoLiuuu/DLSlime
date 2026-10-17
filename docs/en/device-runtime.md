@@ -30,6 +30,12 @@ a destructor, the process terminates instead of freeing possibly active buffers.
 Explicit `wait` and `synchronize` surface driver errors to the caller. A caller
 must not mutate source memory or consume destination memory before the event.
 
+Failed native copy, event-record, and stream-wait submissions drain the affected
+stream before their event or producer dependencies are released, because a native
+call may accept work before reporting an error. The original error is rethrown
+when draining succeeds; if draining fails, the process terminates with the
+pending resources still retained. Successful submissions remain asynchronous.
+
 Use `consumer.wait(producer_event)` before enqueueing dependent work. This is
 device-stream ordering. `event.wait()` is CPU visibility for the completed copy;
 neither constitutes transport delivery or a remote application ACK. Backend HBM

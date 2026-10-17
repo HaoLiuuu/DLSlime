@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstring>
 #include <deque>
+#include <initializer_list>
 #include <map>
 #include <numeric>
 #include <set>
@@ -30,6 +31,9 @@ enum class Fault {
     CopyBefore,
     CopyAfter,
     Record,
+    RecordAfter,
+    StreamWaitBefore,
+    StreamWaitAfter,
     Wait,
     Synchronize
 };
@@ -46,6 +50,7 @@ class FakeDriver final: public detail::Driver {
     };
     struct EventData {
         bool                      recorded = false, done = false;
+        size_t                    pending_waiters = 0;
         std::weak_ptr<StreamData> stream;
     };
     mutable std::recursive_mutex                        mutex_;
@@ -55,11 +60,12 @@ class FakeDriver final: public detail::Driver {
     std::map<uint64_t, std::pair<uintptr_t, uintptr_t>> pending_;
     std::set<const StreamData*>                         advancing_;
     uint64_t                                            next_ = 1, completed_ = 0, checksum_ = 0;
-    Fault                                               fault_ = Fault::None;
+    std::deque<Fault>                                   faults_;
+    uint64_t                                            synchronize_attempts_ = 0;
     void                                                fail(Fault point)
     {
-        if (fault_ == point) {
-            fault_ = Fault::None;
+        if (!faults_.empty() && faults_.front() == point) {
+            faults_.pop_front();
             throw InjectedFailure();
         }
     }
@@ -96,7 +102,17 @@ public:
     void failNext(Fault fault)
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
-        fault_ = fault;
+        faults_ = {fault};
+    }
+    void failSequence(std::initializer_list<Fault> faults)
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        faults_.assign(faults);
+    }
+    uint64_t synchronizeAttempts() const
+    {
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        return synchronize_attempts_;
     }
     size_t allocationCount() const
     {
@@ -178,6 +194,7 @@ public:
     void synchronize(NativeHandle id) override
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
+        ++synchronize_attempts_;
         fail(Fault::Synchronize);
         advance(streams_.at(id));
     }
@@ -193,6 +210,8 @@ public:
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
         auto                                  event = events_.at(id);
+        if (event->pending_waiters)
+            throw std::runtime_error("event destroyed before consumer wait retired");
         if (event->recorded && !event->done)
             throw std::runtime_error("event destroyed before completion");
         events_.erase(id);
@@ -208,6 +227,7 @@ public:
         stream->operations.push_back([event] { event->done = true; });
         event->stream   = stream;
         event->recorded = true;
+        fail(Fault::RecordAfter);
     }
     bool ready(NativeHandle id) override
     {
@@ -223,8 +243,14 @@ public:
     void streamWait(NativeHandle streamId, NativeHandle eventId) override
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
-        auto                                  event = events_.at(eventId);
-        streams_.at(streamId)->operations.push_back([this, event] { complete(event); });
+        fail(Fault::StreamWaitBefore);
+        auto event = events_.at(eventId);
+        streams_.at(streamId)->operations.push_back([this, event] {
+            complete(event);
+            --event->pending_waiters;
+        });
+        ++event->pending_waiters;
+        fail(Fault::StreamWaitAfter);
     }
     void copy(void* dst, MemoryKind, const void* src, MemoryKind, size_t bytes, NativeHandle id) override
     {

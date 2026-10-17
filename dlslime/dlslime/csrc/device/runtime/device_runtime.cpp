@@ -188,6 +188,9 @@ void Stream::wait(const Event& producer) const
         state_->driver->streamWait(state_->handle, producer.state_->handle);
     }
     catch (...) {
+        // A failing native call may already have queued a consumer wait.
+        // Keep its event alive until the consumer stream is quiescent.
+        detail::cleanup([&] { state_->driver->synchronize(state_->handle); });
         state_->dependencies.pop_back();
         throw;
     }
@@ -204,8 +207,15 @@ Event DeviceRuntime::record(const Stream& stream) const
     require(bool(stream.state_) && stream.state_->driver == driver_, "stream belongs to a different runtime");
     auto                        e = eventState(driver_);
     std::lock_guard<std::mutex> lock(stream.state_->mutex);
-    driver_->record(e->handle, stream.state_->handle);
-    e->recorded = true;
+    try {
+        driver_->record(e->handle, stream.state_->handle);
+        e->recorded = true;
+    }
+    catch (...) {
+        // The event marker may have been accepted before the error was reported.
+        detail::cleanup([&] { driver_->synchronize(stream.state_->handle); });
+        throw;
+    }
     e->dependencies.swap(stream.state_->dependencies);
     return Event(e);
 }
