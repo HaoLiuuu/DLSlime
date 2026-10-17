@@ -497,12 +497,16 @@ void RDMAEndpoint::shutdownImpl(bool remove_worker)
 int32_t RDMAEndpoint::registerOrAccessMemoryRegion(uintptr_t mr_key, uintptr_t ptr, uintptr_t offset, size_t length)
 {
     std::string auto_name = "mr_" + std::to_string(mr_key);
+    if (offset > UINTPTR_MAX - ptr)
+        throw std::invalid_argument("RDMA registration pointer offset overflow");
     return local_pool_->registerMemoryRegion(ptr + offset, length, auto_name);
 }
 
 int32_t
 RDMAEndpoint::registerOrAccessMemoryRegion(const std::string& name, uintptr_t ptr, uintptr_t offset, size_t length)
 {
+    if (offset > UINTPTR_MAX - ptr)
+        throw std::invalid_argument("RDMA registration pointer offset overflow");
     return local_pool_->registerMemoryRegion(ptr + offset, length, name);
 }
 

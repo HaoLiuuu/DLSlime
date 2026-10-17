@@ -8,8 +8,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <system_error>
 #include <unordered_map>
 
+#include "dlslime/csrc/device/runtime/device_runtime.h"
 #include "dlslime/csrc/logging.h"
 #include "dlslime/csrc/observability/obs.h"
 
@@ -17,6 +19,7 @@ namespace dlslime {
 
 int32_t RDMAMemoryPool::registerMemoryRegion(uintptr_t data_ptr, uint64_t length, std::optional<std::string> name)
 {
+    device::validateVerbsRegistration(reinterpret_cast<const void*>(data_ptr), length);
     std::unique_lock<std::mutex> lock(name_mutex_);
 
     // Observability: classify this MR as a system (internal) or
@@ -45,11 +48,18 @@ int32_t RDMAMemoryPool::registerMemoryRegion(uintptr_t data_ptr, uint64_t length
         // MR-bytes counter; the old length was already counted at initial register.
         uint64_t old_length = existing->length;
         SLIME_LOG_INFO("Re-registering MR at ", (void*)data_ptr, ": old length=", old_length, ", new length=", length);
-        ibv_dereg_mr(existing);
-
         int     access_rights = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
         ibv_mr* mr            = ibv_reg_mr(pd_, (void*)data_ptr, length, access_rights);
-        SLIME_ASSERT(mr, " Failed to re-register memory " << data_ptr);
+        if (!mr)
+            throw std::system_error(errno ? errno : EIO, std::generic_category(), "ibv_reg_mr(replacement)");
+        // Preserve the old registration when allocating its replacement fails.
+        int deregister = ibv_dereg_mr(existing);
+        if (deregister) {
+            int error = deregister > 0 ? deregister : (errno ? errno : EIO);
+            if (ibv_dereg_mr(mr))
+                std::terminate();  // Cannot safely forget an unretired provider resource.
+            throw std::system_error(error, std::generic_category(), "ibv_dereg_mr(replacement)");
+        }
         handle_to_mr_[handle] = mr;
 
         if (name.has_value()) {
@@ -72,7 +82,8 @@ int32_t RDMAMemoryPool::registerMemoryRegion(uintptr_t data_ptr, uint64_t length
     // New Registration
     int     access_rights = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     ibv_mr* mr            = ibv_reg_mr(pd_, (void*)data_ptr, length, access_rights);
-    SLIME_ASSERT(mr, " Failed to register memory " << data_ptr);
+    if (!mr)
+        throw std::system_error(errno ? errno : EIO, std::generic_category(), "ibv_reg_mr");
 
     int32_t handle = handle_to_mr_.size();
     handle_to_mr_.push_back(mr);

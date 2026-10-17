@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <atomic>
 #include <fstream>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <stdexcept>
 
 #include "runtime_internal.h"
@@ -186,6 +188,9 @@ void Stream::wait(const Event& producer) const
         state_->driver->streamWait(state_->handle, producer.state_->handle);
     }
     catch (...) {
+        // A failing native call may already have queued a consumer wait.
+        // Keep its event alive until the consumer stream is quiescent.
+        detail::cleanup([&] { state_->driver->synchronize(state_->handle); });
         state_->dependencies.pop_back();
         throw;
     }
@@ -202,8 +207,15 @@ Event DeviceRuntime::record(const Stream& stream) const
     require(bool(stream.state_) && stream.state_->driver == driver_, "stream belongs to a different runtime");
     auto                        e = eventState(driver_);
     std::lock_guard<std::mutex> lock(stream.state_->mutex);
-    driver_->record(e->handle, stream.state_->handle);
-    e->recorded = true;
+    try {
+        driver_->record(e->handle, stream.state_->handle);
+        e->recorded = true;
+    }
+    catch (...) {
+        // The event marker may have been accepted before the error was reported.
+        detail::cleanup([&] { driver_->synchronize(stream.state_->handle); });
+        throw;
+    }
     e->dependencies.swap(stream.state_->dependencies);
     return Event(e);
 }
@@ -272,6 +284,73 @@ size_t DmaBuf::granularity() const
 {
     require(bool(state_), "empty DMA-BUF");
     return state_->exported.granularity;
+}
+void validateVerbsRegistration(const void* pointer, size_t bytes)
+{
+    auto address = reinterpret_cast<uintptr_t>(pointer);
+    require(address && bytes && bytes <= std::numeric_limits<uintptr_t>::max() - address,
+            "invalid verbs registration range");
+#ifdef DLSLIME_RUNTIME_ASCEND
+    // Owned allocations allow exact range checks without consulting an optional
+    // staging endpoint. Any accelerator allocation is forbidden in this build.
+    bool ownedHost = false, ownedPinnedHost = false;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        auto                        it = registry.upper_bound(address);
+        if (it != registry.begin()) {
+            --it;
+            if (auto a = it->second.lock()) {
+                if (address - a->info.base < a->info.bytes) {
+                    require(hostMemory(a->info.kind),
+                            "Ascend transport requires DRAM staging; HBM verbs registration is forbidden");
+                    require(bytes <= a->info.bytes - (address - a->info.base),
+                            "verbs range exceeds its owned allocation");
+                    ownedHost       = true;
+                    ownedPinnedHost = a->info.kind == MemoryKind::HostPinned;
+                }
+            }
+        }
+    }
+    // Check CPU mappings first. An unmapped device address, driver mapping, hole
+    // or inaccessible page is never sent to the SDK or ibv_reg_mr. Recheck every
+    // VMA segment and both endpoints; no caller-supplied memory-kind override.
+    std::ifstream maps("/proc/self/maps");
+    require(bool(maps), "cannot validate HOST mappings");
+    uintptr_t cursor = address, end = address + bytes;
+    for (std::string line; cursor < end && std::getline(maps, line);) {
+        std::istringstream row(line);
+        std::string        range, permissions, offset, device, inode, path;
+        row >> range >> permissions >> offset >> device >> inode;
+        std::getline(row, path);
+        auto dash = range.find('-');
+        if (dash == std::string::npos)
+            continue;
+        uintptr_t lo = std::stoull(range.substr(0, dash), nullptr, 16),
+                  hi = std::stoull(range.substr(dash + 1), nullptr, 16);
+        if (hi <= cursor)
+            continue;
+        require(lo <= cursor && permissions.size() >= 2 && permissions[0] == 'r' && permissions[1] == 'w',
+                "verbs range is not fully CPU-readable/writable HOST memory");
+        // CANN pinned HOST allocations can be mapped through its device file.
+        // Trust only our exact owned allocation, never an external pointer hint
+        // or the mapped pathname alone. Unowned device mappings remain denied.
+        require(ownedPinnedHost || path.find("/dev/") == std::string::npos,
+                "unowned device-backed mapping is not proven HOST DRAM");
+        uintptr_t stop = std::min(end, hi);
+        if (!ownedHost)
+            for (uintptr_t p : {cursor, stop - 1}) {
+                auto info = detail::queryAscendForRegistration(reinterpret_cast<void*>(p));
+                require(
+                    hostMemory(info.kind),
+                    "Ascend verbs registration requires proven HOST memory; DEVICE, MANAGED and UNKNOWN are rejected");
+                if (info.range_known)
+                    require(p >= info.base && p - info.base < info.bytes && stop - p <= info.bytes - (p - info.base),
+                            "verbs range exceeds SDK allocation");
+            }
+        cursor = stop;
+    }
+    require(cursor == end, "verbs range crosses unmapped memory");
+#endif
 }
 namespace detail {
 int pciNumaNode(const std::string& pci)

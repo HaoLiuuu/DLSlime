@@ -14,6 +14,8 @@ struct DmaBufExport {
     int    fd     = -1;
     size_t offset = 0, bytes = 0, exported_bytes = 0, granularity = 0;
 };
+// Native asynchronous submission may fail after accepting work. Callers must
+// drain the affected stream before releasing resources referenced by that work.
 class Driver {
 public:
     virtual DmaBufExport exportDmaBuf(void*, size_t, size_t, size_t)
@@ -106,5 +108,6 @@ std::shared_ptr<Driver> makeHost();
 std::shared_ptr<Driver> makeCuda(int);
 std::shared_ptr<Driver> makeMaca(int);
 std::shared_ptr<Driver> makeAscend(int);
+PointerInfo             queryAscendForRegistration(const void* pointer);
 int                     pciNumaNode(const std::string& pci);
 }  // namespace dlslime::device::detail

@@ -1,0 +1,54 @@
+#include <dlfcn.h>
+#include <infiniband/verbs.h>
+
+#include <atomic>
+#include <cerrno>
+#include <cstdint>
+#undef ibv_reg_mr
+namespace {
+std::atomic<uintptr_t> forbidden{0};
+std::atomic<size_t>    forbiddenBytes{0};
+std::atomic<uint64_t>  calls{0}, blocked{0};
+std::atomic<int>       injectedError{0};
+}  // namespace
+extern "C" void dlslime_probe_forbid(void* p, size_t n)
+{
+    forbidden      = reinterpret_cast<uintptr_t>(p);
+    forbiddenBytes = n;
+}
+extern "C" void dlslime_probe_fail_next(int error)
+{
+    injectedError = error;
+}
+extern "C" uint64_t dlslime_probe_calls()
+{
+    return calls.load();
+}
+extern "C" uint64_t dlslime_probe_blocked()
+{
+    return blocked.load();
+}
+extern "C" ibv_mr* ibv_reg_mr(ibv_pd* pd, void* p, size_t n, int access)
+{
+    ++calls;
+    auto a = reinterpret_cast<uintptr_t>(p), f = forbidden.load();
+    auto bytes = forbiddenBytes.load();
+    if (f && (a >= f ? a - f < bytes : f - a < n)) {
+        ++blocked;
+        errno = EACCES;
+        return nullptr;
+    }
+    if (int error = injectedError.exchange(0)) {
+        errno = error;
+        return nullptr;
+    }
+    using Register = ibv_mr* (*)(ibv_pd*, void*, size_t, int);
+    // Forward the ABI used by DLSlime. Unversioned dlsym can resolve the
+    // legacy IBVERBS_1.0 compatibility function, which expects a different PD.
+    static auto native = reinterpret_cast<Register>(dlvsym(RTLD_NEXT, "ibv_reg_mr", "IBVERBS_1.1"));
+    if (!native) {
+        errno = ENOSYS;
+        return nullptr;
+    }
+    return native(pd, p, n, access);
+}
